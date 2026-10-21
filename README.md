@@ -6,18 +6,25 @@ Windows x64 / Photoshop 2026 **27.8+**，当前版本 **0.5.0**。
 **YOLOE-26x**（快速，视觉提示）两个模型。
 
 本仓库只包含插件本身；可用的 ONNX 模型包由独立的
-[model-pipeline](../samps-model-pipeline) 仓库产出，通过 git submodule 引入
-（见下方"获取模型"）。模型包格式契约见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+[model-pipeline](../samps-model-pipeline) 仓库产出。模型会发布到 ModelScope/
+Hugging Face（具体地址待发布后补充），不随本仓库分发。模型包格式契约见
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## 获取模型
 
 ```powershell
-git submodule update --init
 .\.venv\Scripts\python.exe tools\stage_models.py
 ```
 
-这会把 `model-pipeline/models/{sam3.1-vision-fp16s,yoloe26x-onnx}` 下已验证的
-ONNX 包复制进 `dist/models/`，供面板加载。
+模型发布前，可以用 `--models-root` 指向本地已经构建好的模型目录（例如
+model-pipeline 仓库自己的 `models/`）：
+
+```powershell
+.\.venv\Scripts\python.exe tools\stage_models.py --models-root ..\samps-model-pipeline\models
+```
+
+这会把 `{sam3.1-vision-fp16s,yoloe26x-onnx}` 两个已验证的 ONNX 包复制进
+`dist/models/`，供面板加载。
 
 ## 构建
 
@@ -79,10 +86,9 @@ ctest --test-dir build-core -C Release --output-on-failure
 - `native/tests/`：`prompt.cpp`（CTest 几何测试）、`validation.cpp`/`behavior.cpp`
   （开发期对照/压力测试运行器，不随插件分发）。
 - `docs/ARCHITECTURE.md`：当前架构、模型包契约。
-- `model-pipeline/`：git submodule，指向模型流水线仓库（导出/转换/校验脚本见其
-  `tools/`，不在本仓库）。
 - `tools/`：原生构建辅助（`fetch_native_deps.py`、`build.ps1`）、
-  打包校验（`verify_hybrid.py`）、模型分发（`stage_models.py`）、
-  开发期调试（`cdp_eval.cjs`）。
+  打包校验（`verify_hybrid.py`）、模型获取/分发（`stage_models.py`）、
+  开发期调试（`cdp_eval.cjs`）。模型的导出/转换/校验脚本在独立的
+  [model-pipeline](../samps-model-pipeline) 仓库里，不在本仓库。
 
 项目代码采用 AGPL-3.0，依赖说明见 [第三方声明](THIRD_PARTY_NOTICES.md)。

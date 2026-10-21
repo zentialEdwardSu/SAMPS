@@ -1,12 +1,18 @@
-"""Copy validated ONNX bundles into dist/models/<folder> for UDT loading and packaging.
+"""Fetch validated ONNX bundles and copy them into dist/models/<folder>.
 
-Model bundles live in the model-pipeline repo (git submodule at model-pipeline/),
-not in this repo. Only files listed in each model.json (plus model.json itself) are
-copied; torch references and validation scratch files stay in the submodule. Folder
-names match plugin-src/src/ui/models.ts.
+Model bundles are published separately (ModelScope / Hugging Face Hub), not
+vendored into this repo. Each bundle is fetched into a local cache directory
+(default: a sibling `model-cache/` next to this repo) and then copied into
+`dist/models/<folder>/` for UDT loading and packaging. Folder names match
+plugin-src/src/ui/models.ts.
 
-    git submodule update --init
+If a bundle is already present as a local directory (e.g. you built it
+yourself with the model-pipeline repo, or downloaded it by hand), pass
+--models-root pointing at the directory that contains `models/<bundle-name>/`
+and the download step is skipped for bundles found there.
+
     python tools/stage_models.py
+    python tools/stage_models.py --models-root ../samps-model-pipeline/models
 """
 import argparse
 import hashlib
@@ -15,7 +21,17 @@ from pathlib import Path
 import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
-BUNDLE_NAMES = {'sam3': 'models/sam3.1-vision-fp16s', 'yoloe26x': 'models/yoloe26x-onnx'}
+
+# folder: the name the plugin UI uses (plugin-src/src/ui/models.ts) and the
+# subdirectory under dist/models/.
+# source: where to fetch the bundle from when it is not already available
+# locally. Fill in the real repo id once the bundles are published; until
+# then, use --models-root to point at a local models/ directory instead
+# (e.g. the model-pipeline repo's own models/ directory).
+BUNDLES = {
+    'sam3': {'local_name': 'sam3.1-vision-fp16s', 'hub': None},
+    'yoloe26x': {'local_name': 'yoloe26x-onnx', 'hub': None},
+}
 
 
 def digest(path):
@@ -26,16 +42,40 @@ def digest(path):
     return h.hexdigest()
 
 
+def fetch(bundle, cache_dir):
+    """Returns the local directory for `bundle`, downloading into `cache_dir` if needed."""
+    destination = cache_dir / bundle['local_name']
+    if destination.is_dir():
+        return destination
+    if not bundle['hub']:
+        raise RuntimeError(
+            f"{bundle['local_name']} is not cached at {destination} and no hub source is configured yet. "
+            "Pass --models-root pointing at a directory containing models/<bundle>/, "
+            "or wait for the published model repo id to be filled in here.")
+    # Placeholder for the eventual ModelScope/Hugging Face download, e.g.:
+    #   from huggingface_hub import snapshot_download
+    #   snapshot_download(repo_id=bundle['hub'], local_dir=destination)
+    raise NotImplementedError('Hub download not wired up yet; see BUNDLES in this file.')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dist', type=Path, default=ROOT / 'dist')
-    parser.add_argument('--models-root', type=Path, default=ROOT / 'model-pipeline',
-                        help='Root containing models/<bundle>/ (the model-pipeline submodule by default)')
+    parser.add_argument('--models-root', type=Path, default=None,
+                        help='A directory containing models/<bundle>/ to use instead of the download cache '
+                             '(e.g. a local checkout of the model-pipeline repo)')
+    parser.add_argument('--cache-dir', type=Path, default=ROOT.parent / 'model-cache',
+                        help='Where downloaded bundles are cached (default: sibling model-cache/ directory)')
     args = parser.parse_args()
-    if not args.models_root.is_dir():
-        raise RuntimeError(f'{args.models_root} is missing; run: git submodule update --init')
-    bundles = {folder: args.models_root / relative for folder, relative in BUNDLE_NAMES.items()}
-    for folder, source in bundles.items():
+    args.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    for folder, bundle in BUNDLES.items():
+        if args.models_root:
+            source = args.models_root / bundle['local_name']
+            if not source.is_dir():
+                raise RuntimeError(f'{source} not found under --models-root')
+        else:
+            source = fetch(bundle, args.cache_dir)
         manifest = json.loads((source / 'model.json').read_text(encoding='utf-8'))
         if not manifest.get('validation', {}).get('passed'):
             raise RuntimeError(f'{source} has not passed validation')

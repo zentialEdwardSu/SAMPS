@@ -23,10 +23,12 @@
 ## Models
 
 Model weights and their ONNX export tooling are not part of this repository.
-They are produced and licensed independently in the model-pipeline repository
-(`model-pipeline/`, git submodule) — see its own `THIRD_PARTY_NOTICES.md` for
-the Ultralytics YOLOE-26 (AGPL-3.0) and Meta SAM 3.1 (SAM License) terms that
-apply to the model packages this plugin loads at runtime.
+They are produced in the separate
+[model-pipeline](../samps-model-pipeline) repository and published
+independently (ModelScope/Hugging Face) — see that repository's own
+`THIRD_PARTY_NOTICES.md` for the Ultralytics YOLOE-26 (AGPL-3.0) and Meta
+SAM 3.1 (SAM License) terms that apply to the model packages this plugin
+loads at runtime.
 
 Python, PyTorch, and the model export/conversion tooling are not runtime
 dependencies of this plugin.

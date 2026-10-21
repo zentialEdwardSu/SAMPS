@@ -20,7 +20,8 @@
 模块加载期间卸载插件会阻止迟到的初始化。
 
 `tools/build.ps1` 和 CMake 默认构建 Hybrid；`tools/stage_models.py` 把已验证的
-ONNX 模型包从 `model-pipeline/`（子模块）复制进 `dist/models/`。
+ONNX 模型包（发布在 ModelScope/Hugging Face，或通过 `--models-root` 指向本地
+构建的目录）复制进 `dist/models/`。
 
 ```text
 Photoshop Imaging API → RGBA / add-prompt alpha / exclude alpha → UXP addon worker
@@ -47,8 +48,8 @@ Photoshop Imaging API → RGBA / add-prompt alpha / exclude alpha → UXP addon 
 - `validation.passed`：未通过且未显式允许试用时拒绝加载。
 - `requiresGpu`：为真时拒绝 CPU 回退，初始化失败直接报错而非降级。
 
-这是模型流水线仓库（`tools/export_model.py`、`tools/export_sam3.py`、
-`tools/stage_models.py`）和本仓库共同遵守的接口；改动需要两边同步。
+这是模型流水线仓库（`tools/export_model.py`、`tools/export_sam3.py`）和
+本仓库 `tools/stage_models.py` 共同遵守的接口；改动需要两边同步。
 
 ## 设备、内存及生命周期
 

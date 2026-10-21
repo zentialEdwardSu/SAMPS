@@ -1,0 +1,92 @@
+/* Photoshop panel density: 11–12px text, 4px grid, host theme colors. */
+:root {
+  --bg: var(--uxp-host-background-color, #323232);
+  --ink: var(--uxp-host-text-color, #d6d6d6);
+  --muted: var(--uxp-host-text-color-secondary, #9a9a9a);
+  --line: var(--uxp-host-border-color, #4a4a4a);
+  --accent: var(--uxp-host-link-text-color, #378ef0);
+  --error: #ec5b62;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+/* Photoshop keeps showing the active tool's cursor (brush, eraser) over a panel that sets none.
+   Give the whole panel an arrow and every control a pointer. */
+html, body, #app, .panel { cursor: default; }
+sp-action-button, sp-button, sp-checkbox, sp-picker, sp-menu-item, sp-slider, button, label { cursor: pointer; }
+[disabled] { cursor: default; }
+body { background: var(--bg); color: var(--ink); font-size: var(--uxp-host-font-size, 12px); overflow-y: auto; }
+#app { min-width: 0; width: 100%; min-height: 100%; }
+.panel { display: flex; flex-direction: column; padding: 4px 8px 12px; width: 100%; box-sizing: border-box; }
+.doc { padding: 4px 0 6px; border-bottom: 1px solid var(--line); }
+.doc-name { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+
+.section { padding: 8px 0; border-bottom: 1px solid var(--line); display: flex; flex-direction: column; }
+.section:last-child { border-bottom: none; }
+.section-title { display: flex; align-items: center; justify-content: space-between; min-height: 24px; margin-bottom: 4px; }
+.section-title sp-detail { text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+
+.row { display: flex; align-items: center; }
+.row .picker:first-child { flex: 1; margin-right: 4px; }
+.row .picker:last-child { width: 72px; }
+.picker { min-width: 0; }
+
+.toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-bottom: 4px; }
+.toolbar > sp-action-button { margin-right: 2px; }
+.spacer { flex: 1; }
+.segmented { display: flex; }
+.segmented sp-action-button { margin-right: 0; border-radius: 0; }
+.segmented sp-action-button:first-child { border-top-left-radius: 4px; border-bottom-left-radius: 4px; }
+.segmented sp-action-button:last-child { border-top-right-radius: 4px; border-bottom-right-radius: 4px; }
+.icon { display: block; }
+.inline { display: flex; }
+
+.muted { color: var(--muted); display: block; }
+.hint { margin: 2px 0 6px; line-height: 1.5; }
+.slider-row { display: flex; align-items: center; margin: 2px 0 6px; }
+.slider-row sp-label { width: 48px; flex-shrink: 0; }
+.slider { flex: 1; min-width: 0; }
+.value { width: 34px; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+
+.actions { display: flex; margin: 4px 0; }
+.actions sp-button { flex: 1; }
+.actions sp-button + sp-button { margin-left: 6px; }
+.progress { width: 100%; margin: 4px 0; }
+.status { display: block; margin-top: 4px; min-height: 16px; color: var(--muted); line-height: 1.5; }
+.status.error { color: var(--error); }
+
+/* The instance list grows with the panel height instead of a fixed cap. */
+.instances { display: flex; flex-direction: column; max-height: 40vh; overflow-y: auto; }
+.instance { display: flex; align-items: center; justify-content: space-between; min-height: 24px; }
+.score { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+.diagnostics { display: flex; flex-direction: column; }
+.preview { width: 120px; height: 120px; margin-top: 6px; background: #000; image-rendering: pixelated; }
+
+.swatch { display: inline-block; margin-right: 4px; vertical-align: middle; }
+.segmented + .segmented { margin-left: 4px; }
+/* Narrow docks: stack the model pickers and let buttons share the row. */
+@media (max-width: 260px) {
+  .row { flex-wrap: wrap; }
+  .row .picker:first-child { flex: 1 1 100%; margin-right: 0; margin-bottom: 4px; }
+  .row .picker:last-child { width: 100%; }
+}
+
+/* Mode switch: the selected option is a CTA sp-button (same blue as 识别); options share the row. */
+.mode-row { display: flex; align-items: center; margin: 2px 0 4px; }
+.mode-row sp-label { width: 64px; flex-shrink: 0; }
+.switch { display: flex; flex: 1; min-width: 0; gap: 4px; }
+.switch .option { flex: 1; min-width: 0; }
+
+/* Icon and label on one line inside action buttons. */
+.icon-label { display: flex; flex-direction: row; align-items: center; gap: 4px; white-space: nowrap; }
+.icon-label .icon, .icon-label .swatch { display: inline-block; margin: 0; flex-shrink: 0; }
+
+/* Selection settings dialog (opened with uxpShowModal). */
+.selection-dialog { padding: 12px 16px; background: var(--bg); color: var(--ink); }
+.selection-dialog sp-heading { margin: 0 0 10px; }
+.selection-dialog .field { display: flex; align-items: center; margin-top: 8px; }
+.selection-dialog .field sp-label { width: 40px; flex-shrink: 0; }
+.selection-dialog .number { width: 96px; }
+.selection-dialog .unit { margin-left: 6px; color: var(--muted); }
+.selection-dialog .note { display: block; margin: 2px 0 0 40px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }

@@ -1,0 +1,11 @@
+.venv/
+.venv-*/
+.deps/
+build/
+build-*/
+dist/
+__pycache__/
+*.pyc
+artifacts/*
+!artifacts/.gitkeep
+*.user

@@ -1,6 +1,6 @@
 # SAMPS — Photoshop UXP Hybrid 视觉分割插件
 
-Windows x64 / Photoshop 2026 **27.8+**，当前版本 **0.5.0**。
+Windows x64 / Photoshop 2024 **25.0+**，当前版本 **0.5.0**。
 插件采用 **UXP 停靠面板（React）+ C++ `.uxpaddon` + ONNX Runtime（DirectML/CPU）**。
 内置 **SAM 3.1**（高质量，仅 GPU，支持"添加/排除"笔刷和配饰合并）和
 **YOLOE-26x**（快速，视觉提示）两个模型。
@@ -28,13 +28,13 @@ model-pipeline 仓库自己的 `models/`）：
 
 ## 构建
 
-需要 Visual Studio C++、Windows SDK、CMake，以及外部 Adobe UXP Hybrid SDK
-（`UXP_SDK_ROOT`）。原生依赖（ONNX Runtime DirectML、DirectML、nlohmann/json）
-固定版本，哈希见 `dependencies.lock.json`。
+需要 Visual Studio C++、Windows SDK、CMake。原生依赖（ONNX Runtime DirectML、
+DirectML、nlohmann/json，以及 GitHub 上 bolt-uxp 固定 commit 中的 Adobe UXP Hybrid
+SDK）由 `tools/fetch_native_deps.py` 下载到 `.deps/`，哈希见 `dependencies.lock.json`。
 
 ```powershell
 .\.venv\Scripts\python.exe tools\fetch_native_deps.py
-cmake -S . -B build-hybrid -A x64 -DUXP_SDK_ROOT="C:\path\to\uxp-hybrid-sdk"
+cmake -S . -B build-hybrid -A x64 -DUXP_SDK_ROOT=".deps\bolt-uxp-8dca0be1010070883a4cb3b4de6af38509a4c4e4\src\hybrid"
 cmake --build build-hybrid --config Release --target samps
 cd plugin-src
 npm install
@@ -46,7 +46,7 @@ npm run build
 `-CoreOnly` 只构建不依赖 Hybrid SDK 的原生测试可执行文件：
 
 ```powershell
-.\tools\build.ps1 -SdkRoot "C:\path\to\uxp-hybrid-sdk"
+.\tools\build.ps1   # 默认使用 .deps 中的 Hybrid SDK，可用 -SdkRoot 覆盖
 .\tools\build.ps1 -CoreOnly -BuildDirectory build-core
 ```
 

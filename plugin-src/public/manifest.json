@@ -1,17 +1,21 @@
 {
   "manifestVersion": 6,
-  "id": "local.samps.yoloe.visual",
-  "name": "SAMPS 视觉分割",
-  "version": "0.5.0",
+  "id": "samps.edwardsu",
+  "name": "SAMPS",
+  "version": "0.5.1",
   "main": "index.html",
-  "host": { "app": "PS", "minVersion": "27.8.0", "data": { "apiVersion": 2 } },
+  "host": { "app": "PS", "minVersion": "25.0.0", "data": { "apiVersion": 2 } },
   "addon": { "name": "samps-0.5.0.uxpaddon" },
   "requiredPermissions": { "enableAddon": true, "localFileSystem": "request" },
   "entrypoints": [{
-    "type": "panel", "id": "sampsPanel", "label": { "default": "SAMPS 视觉分割" },
+    "type": "panel", "id": "sampsPanel", "label": { "default": "SAMPS" },
     "minimumSize": { "width": 230, "height": 260 },
     "maximumSize": { "width": 2000, "height": 3000 },
     "preferredDockedSize": { "width": 300, "height": 640 },
-    "preferredFloatingSize": { "width": 320, "height": 680 }
+    "preferredFloatingSize": { "width": 320, "height": 680 },
+    "icons": [
+      { "width": 23, "height": 23, "path": "icons/dark.png", "scale": [1, 2], "theme": ["darkest", "dark", "medium"] },
+      { "width": 23, "height": 23, "path": "icons/light.png", "scale": [1, 2], "theme": ["lightest", "light"] }
+    ]
   }]
 }

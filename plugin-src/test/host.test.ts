@@ -4,7 +4,7 @@ import { PhotoshopHost } from "../src/host/PhotoshopHost";
 // A small Photoshop model: one document, a selection plane, layers with alpha,
 // and the batchPlay descriptors the host uses. It records every call so tests can
 // assert that no temporary documents are created and the source is never altered.
-function photoshop({ title = "raw.psd", mode = "labColorMode", depth = "bitDepth16", failRgb = false, selection = null as number[] | null } = {}) {
+function photoshop({ title = "raw.psd", mode = "labColorMode", depth = "bitDepth16", failRgb = false, selection = null as number[] | null, ps24 = false } = {}) {
   const W = 3, H = 2, calls: string[] = [], commits: boolean[] = [];
   const promptAlpha = Uint8Array.of(0, 200, 0, 0, 0, 0);
   const prompt: any = { id: 2, name: "[SAMPS 提示] 用画笔标记目标", visible: true, kind: "pixel", alpha: promptAlpha };
@@ -47,6 +47,8 @@ function photoshop({ title = "raw.psd", mode = "labColorMode", depth = "bitDepth
     return layer;
   };
   for (const layer of doc.layers) duplicable(layer);
+  // Photoshop 24.x: Document.selection exists, but Selection.bounds / deselect() arrive in 25.0.
+  if (ps24) doc.selection = {};
   const ps: any = { app: { documents: [doc], activeDocument: doc } };
   ps.app.createDocument = () => { throw new Error("temporary documents are not allowed"); };
   doc.duplicate = () => { throw new Error("document duplicates are not allowed"); };
@@ -57,8 +59,13 @@ function photoshop({ title = "raw.psd", mode = "labColorMode", depth = "bitDepth
     } });
   } };
   ps.action = { async batchPlay(commands: any[]) {
+    const out: any[] = [];
     for (const c of commands) {
-      if (c._obj === "set" && c.to?._ref) {
+      if (c._obj === "get" && c._target?.[0]?._property === "selection") {
+        calls.push("getSelectionDescriptor");
+        out.push(sel && sel.some(v => v) ? { selection: { _obj: "rectangle" } } : {});
+      } else if (c._obj === "set" && c.to?._value === "none") { calls.push("deselect"); sel = null; }
+      else if (c._obj === "set" && c.to?._ref) {
         const id = c.to._ref[1]._id; calls.push(`selection=transparency:${id}`);
         const all = (ls: any[]): any[] => ls.flatMap((l: any) => [l, ...(l.layers ? all(l.layers) : [])]);
         sel = Uint8Array.from(all(doc.layers).find((l: any) => l.id === id).alpha);
@@ -72,7 +79,7 @@ function photoshop({ title = "raw.psd", mode = "labColorMode", depth = "bitDepth
         calls.push("stampVisible");
       } else if (c._obj === "make") { const layer = doc.activeLayers[0]; layer.mask = sel ? Uint8Array.from(sel) : null; calls.push(`mask:${layer.id}`); }
     }
-    return [];
+    return out;
   } };
   ps.imaging = {
     async getSelection() {
@@ -359,4 +366,19 @@ test("writeback refuses stale history before creating anything", async () => {
   mock.doc.activeHistoryState = { id: 99 };
   await expect(mock.host.output(snapshot, [instance], "layers")).rejects.toMatchObject({ code: "DOCUMENT_CHANGED" });
   expect(mock.calls).not.toContain("stampVisible");
+});
+
+test("Photoshop 24.x without Selection.bounds / deselect() keeps the user's selection through batchPlay", async () => {
+  const mock = photoshop({ ps24: true, selection: [0, 255, 255, 0, 0, 0] });
+  const snapshot = await mock.host.capture();
+  expect([...mock.selection!]).toEqual([0, 255, 255, 0, 0, 0]);
+  expect(mock.calls).toContain("getSelectionDescriptor");
+  await mock.host.output(snapshot, [instance], "selection", { mode: "add" });
+  expect([...mock.selection!]).toEqual([255, 255, 255, 0, 0, 0]);
+  await mock.host.output({ ...snapshot, stamp: mock.host.stamp() }, [instance], "selection", { mode: "subtract" });
+  await mock.host.output({ ...snapshot, stamp: mock.host.stamp() }, [instance], "selection", { mode: "intersect" });
+  mock.calls.length = 0;
+  await mock.host.writeSelection(mock.doc, null);
+  expect(mock.calls).toEqual(["deselect"]);
+  expect(mock.selection).toBeNull();
 });

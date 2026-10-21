@@ -100,7 +100,7 @@ export class PhotoshopHost {
       layer.visible = true;
       doc.activeLayers = [layer];
       doc.activeChannels = doc.componentChannels;
-      await doc.selection.deselect();
+      await this.deselect(doc);
       await this.batchPlay([{ _obj: "select", _target: [{ _ref: tool === "brush" ? "paintbrushTool" : "eraserTool" }],
         _options: silent }]);
       if (tool === "brush") {
@@ -184,10 +184,30 @@ export class PhotoshopHost {
 
   // ── Selection helpers ────────────────────────────────────────────────
 
+  /**
+   * True when the document has an active selection. Selection.bounds needs Photoshop 25.0;
+   * on 24.x the document's selection descriptor is read instead (absent when nothing is selected).
+   */
+  async hasSelection(doc: Doc): Promise<boolean> {
+    const bounds = doc.selection?.bounds;
+    if (bounds !== undefined) return !!bounds;
+    try {
+      const [result] = await this.batchPlay([{ _obj: "get", _target: [{ _property: "selection" }, { _ref: "document", _id: doc.id }],
+        _options: silent }]);
+      return !!(result && result.selection);
+    } catch { return false; }
+  }
+
+  /** Selection.deselect() needs Photoshop 25.0; older hosts set the selection to none. */
+  async deselect(doc: Doc) {
+    if (typeof doc.selection?.deselect === "function") { await doc.selection.deselect(); return; }
+    await this.batchPlay([{ _obj: "set", _target: [{ _ref: "channel", _property: "selection" }],
+      to: { _enum: "ordinal", _value: "none" }, _options: silent }]);
+  }
+
   /** Full-canvas 8-bit selection, or null when nothing is selected. Mode and bit depth independent. */
   async readSelection(doc: Doc): Promise<Uint8Array | null> {
-    const bounds = doc.selection && doc.selection.bounds;
-    if (!bounds) return null;
+    if (!(await this.hasSelection(doc))) return null;
     const result = await this.ps.imaging.getSelection({ documentID: doc.id,
       sourceBounds: { left: 0, top: 0, right: doc.width, bottom: doc.height } });
     try {
@@ -197,7 +217,7 @@ export class PhotoshopHost {
   }
 
   async writeSelection(doc: Doc, mask: Uint8Array | null) {
-    if (!mask || isEmpty(mask)) { await doc.selection.deselect(); return; }
+    if (!mask || isEmpty(mask)) { await this.deselect(doc); return; }
     const gray = await this.grayImage(mask, doc.width, doc.height);
     try { await this.ps.imaging.putSelection({ documentID: doc.id, imageData: gray, replace: true }); }
     finally { gray.dispose(); }
@@ -403,7 +423,7 @@ export class PhotoshopHost {
       selectionModifyEffectAtCanvasBounds: false, _options: silent });
     if (feather) steps.push({ _obj: "feather", radius: pixels(feather), selectionModifyEffectAtCanvasBounds: false,
       _options: silent });
-    if (doc.selection.bounds) await this.batchPlay(steps);
+    if (await this.hasSelection(doc)) await this.batchPlay(steps);
     return (await this.readSelection(doc)) || new Uint8Array(doc.width * doc.height);
   }
 

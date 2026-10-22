@@ -1,6 +1,7 @@
 // SAM 3.1 exemplar segmentation on ONNX Runtime (vision + geometry prompts only).
 //
-// image_encoder.onnx runs once per image (stretched to 1008×1008, normalized to [-1, 1]).
+// image_encoder.onnx runs once per image (stretched to inputSize², 1008 natively or a smaller
+// variant, normalized to [-1, 1]).
 // prompt_decoder.onnx takes up to maxPrompts exemplar boxes: each connected scribble
 // becomes one positive box. SAM 3 then returns every instance of that concept; "current"
 // mode keeps the one that best covers the scribble (see finishInstances).
@@ -11,7 +12,6 @@
 
 namespace samps::detail {
 namespace {
-constexpr int Size = 1008;
 
 struct Box { float x0, y0, x1, y1; };
 
@@ -45,6 +45,24 @@ std::vector<std::pair<size_t, Box>> components(const uint8_t* alpha, int width, 
     return found;
 }
 
+// Weak support of an instance at document pixel (x, y).
+bool currentSupport(const Instance& item, int x, int y) {
+    const int cx = x - item.left, cy = y - item.top;
+    return cx >= 0 && cy >= 0 && cx < item.width && cy < item.height &&
+           supportAt(item, static_cast<size_t>(cy) * item.width + cx);
+}
+
+// Fills mask and support of `item` (already sized and positioned) from 255 / 1 / 0 values.
+template <class Value> void splitSupport(Instance& item, Value value) {
+    const size_t n = static_cast<size_t>(item.width) * item.height;
+    item.mask.assign(n, 0); item.support.assign(n, 0);
+    for (int y = 0; y < item.height; ++y) for (int x = 0; x < item.width; ++x) {
+        const uint8_t v = value(x, y);
+        const size_t i = static_cast<size_t>(y) * item.width + x;
+        item.mask[i] = v == 255 ? 255 : 0; item.support[i] = v ? 1 : 0;
+    }
+}
+
 float iou(const std::array<float, 4>& a, const std::array<float, 4>& b) {
     const float w = std::max(0.f, std::min(a[2], b[2]) - std::max(a[0], b[0]));
     const float h = std::max(0.f, std::min(a[3], b[3]) - std::max(a[1], b[1]));
@@ -57,7 +75,8 @@ class Sam3 final : public Model {
 public:
     Sam3(std::filesystem::path directory, Json manifest)
         : directory_(std::move(directory)), manifest_(std::move(manifest)), resample_(resampleMode(manifest_, "bilinear")) {
-        if (manifest_.value("inputSize", 0) != Size || manifest_.value("resize", std::string()) != "stretch")
+        size_ = manifest_.value("inputSize", 0);
+        if (size_ < 336 || size_ > 1008 || size_ % 14 || manifest_.value("resize", std::string()) != "stretch")
             throw Error("MODEL_VERSION", "Unsupported SAM 3 bundle");
         maxPrompts_ = manifest_.value("maxPrompts", 0);
         queries_ = manifest_.value("queries", 0);
@@ -68,9 +87,16 @@ public:
         refinePoints_ = manifest_.value("refinePoints", 20);
     }
     void open(int device) override {
+        device_ = device;
         image_ = openSession(graphPath(directory_, manifest_, "image"), device, manifest_);
         prompt_ = openSession(graphPath(directory_, manifest_, "prompt"), device, manifest_);
         if (hasRefine_) refine_ = openSession(graphPath(directory_, manifest_, "refine"), device, manifest_);
+    }
+    // The ViT encoder's DirectML arena holds ~5–8 GB after one pass; the decoders need little.
+    void releaseEncoder() override { image_.reset(); }
+    Ort::Session& encoder() {
+        if (!image_) image_ = openSession(graphPath(directory_, manifest_, "image"), device_, manifest_);
+        return *image_;
     }
     // SAM 3's own post-processing fills holes up to fill_hole_area (16 cells of the 288×288
     // mask); the ONNX graphs stop before it, so apply the same area at document scale.
@@ -78,10 +104,12 @@ public:
         const double cells = manifest_.value("fillHoleArea", 16.0);
         return cells * (static_cast<double>(g.width) / maskSize_) * (static_cast<double>(g.height) / maskSize_);
     }
-    bool retainsImage() const override { return hasRefine_; }
+    double maskCell(const Geometry& g) const override {
+        return std::max(static_cast<double>(g.width), static_cast<double>(g.height)) / maskSize_;
+    }
 
     // Detail pass: crop a square around the current object (plus margin) from the full-resolution
-    // document, encode the crop at 1008×1008, and let the interactive head re-predict the mask from
+    // document, encode the crop at full model resolution, and let the interactive head re-predict the mask from
     // a box, points sampled inside the current mask, the add/exclude strokes, and the current mask
     // as a dense prompt. On a 24 MP RAW a person often spans <30% of the frame, so the crop gives
     // the mask 3–10× more pixels across thin structures (straps, lanyards, hair).
@@ -92,7 +120,7 @@ public:
         // Square crop, 15% margin, at least one model input wide, clamped to the document.
         const float margin = .15f * std::max(current.width, current.height);
         float side = std::max(current.width, current.height) + 2 * margin;
-        side = std::min<float>(std::max<float>(side, Size), static_cast<float>(std::max(g.width, g.height)));
+        side = std::min<float>(std::max<float>(side, size_), static_cast<float>(std::max(g.width, g.height)));
         const float cx = current.left + current.width / 2.f, cy = current.top + current.height / 2.f;
         int cw = std::min(g.width, static_cast<int>(std::ceil(side))), ch = std::min(g.height, static_cast<int>(std::ceil(side)));
         int left = std::clamp(static_cast<int>(std::floor(cx - cw / 2.f)), 0, g.width - cw);
@@ -111,17 +139,17 @@ public:
         auto input = preprocess(crop.data(), crop.size(), cw, ch, cg);
         checkCancel(cancel);
         std::vector<Ort::Value> imageInputs;
-        imageInputs.push_back(tensor(input.data(), input.size(), {1, 3, Size, Size}));
-        auto feats = run(*image_, {"image"}, imageInputs, {"iembed", "ifeat0", "ifeat1"}, cancel);
+        imageInputs.push_back(tensor(input.data(), input.size(), {1, 3, size_, size_}));
+        auto feats = run(encoder(), {"image"}, imageInputs, {"iembed", "ifeat0", "ifeat1"}, cancel);
 
         // Prompts in crop-model coordinates.
-        const float sx = static_cast<float>(Size) / cw, sy = static_cast<float>(Size) / ch;
+        const float sx = static_cast<float>(size_) / cw, sy = static_cast<float>(size_) / ch;
         const auto inCurrent = [&](int x, int y) {
             const int ix = x - current.left, iy = y - current.top;
             return ix >= 0 && iy >= 0 && ix < current.width && iy < current.height &&
                    current.mask[static_cast<size_t>(iy) * current.width + ix] > 0;
         };
-        Geometry local{cw, ch, Size, Size, 0, 0, 1.f};
+        Geometry local{cw, ch, size_, size_, 0, 0, 1.f};
         const auto inside = cellCentres(local, [&](int x, int y) { return inCurrent(x + left, y + top); });
         const auto negative = exclude ? cellCentres(local, [&](int x, int y) {
             return exclude[static_cast<size_t>(y + top) * g.width + x + left] != 0; }) : std::vector<std::array<float, 3>>{};
@@ -169,14 +197,16 @@ public:
 
         // Upsample the crop logits into document space. Outside the crop the mask cannot change.
         const float* logits = out[0].data.data();
+        // 255 = predicted, 1 = weak support only (see smoothMask).
         std::vector<uint8_t> detailed(static_cast<size_t>(cw) * ch, 0);
         size_t agree = 0, either = 0;
         for (int y = 0; y < ch; ++y) {
             const float fy = (y + .5f) * maskSize_ / ch - .5f;
             for (int x = 0; x < cw; ++x) {
-                const bool on = bilinearSample(logits, maskSize_, maskSize_, (x + .5f) * maskSize_ / cw - .5f, fy) > 0;
+                const float logit = bilinearSample(logits, maskSize_, maskSize_, (x + .5f) * maskSize_ / cw - .5f, fy);
+                const bool on = logit > 0;
                 const bool before = inCurrent(x + left, y + top);
-                detailed[static_cast<size_t>(y) * cw + x] = on ? 255 : 0;
+                detailed[static_cast<size_t>(y) * cw + x] = on ? 255 : logit > SupportLogit ? 1 : 0;
                 agree += on && before; either += on || before;
             }
             if ((y & 63) == 0) checkCancel(cancel);
@@ -187,21 +217,23 @@ public:
         if (overlap < .6) return false;
 
         int mx0 = g.width, my0 = g.height, mx1 = -1, my1 = -1;
-        auto valueAt = [&](int x, int y) -> bool {
-            if (x >= left && y >= top && x < left + cw && y < top + ch) return detailed[static_cast<size_t>(y - top) * cw + (x - left)] > 0;
-            return inCurrent(x, y);
+        auto valueAt = [&](int x, int y) -> uint8_t {
+            if (x >= left && y >= top && x < left + cw && y < top + ch) return detailed[static_cast<size_t>(y - top) * cw + (x - left)];
+            return inCurrent(x, y) ? 255 : currentSupport(current, x, y) ? 1 : 0;
         };
         const int bx0 = std::min(left, current.left), by0 = std::min(top, current.top);
         const int bx1 = std::max(left + cw, current.left + current.width), by1 = std::max(top + ch, current.top + current.height);
+        bool any = false;
         for (int y = by0; y < by1; ++y) for (int x = bx0; x < bx1; ++x)
-            if (valueAt(x, y)) { mx0 = std::min(mx0, x); my0 = std::min(my0, y); mx1 = std::max(mx1, x); my1 = std::max(my1, y); }
-        if (mx1 < 0) return false;
+            if (const uint8_t v = valueAt(x, y)) {
+                any = any || v == 255;
+                mx0 = std::min(mx0, x); my0 = std::min(my0, y); mx1 = std::max(mx1, x); my1 = std::max(my1, y);
+            }
+        if (!any) return false;
         Instance next = current;
         next.left = mx0; next.top = my0; next.width = mx1 - mx0 + 1; next.height = my1 - my0 + 1;
         next.box = {static_cast<float>(mx0), static_cast<float>(my0), mx1 + 1.f, my1 + 1.f};
-        next.mask.assign(static_cast<size_t>(next.width) * next.height, 0);
-        for (int y = 0; y < next.height; ++y) for (int x = 0; x < next.width; ++x)
-            if (valueAt(x + mx0, y + my0)) next.mask[static_cast<size_t>(y) * next.width + x] = 255;
+        splitSupport(next, [&](int x, int y) { return valueAt(x + mx0, y + my0); });
         next.detailed = true;
         // Hole/island cleanup now works in finer mask cells.
         next.cleanupScale = static_cast<float>(1.0 / (gain * gain));
@@ -231,7 +263,7 @@ public:
         float x0 = static_cast<float>(current.left), y0 = static_cast<float>(current.top);
         float x1 = static_cast<float>(current.left + current.width), y1 = static_cast<float>(current.top + current.height);
         for (const auto& p : missed) { x0 = std::min(x0, p[0]); y0 = std::min(y0, p[1]); x1 = std::max(x1, p[0] + 1); y1 = std::max(y1, p[1] + 1); }
-        const float sx = static_cast<float>(Size) / g.width, sy = static_cast<float>(Size) / g.height;
+        const float sx = static_cast<float>(size_) / g.width, sy = static_cast<float>(size_) / g.height;
         std::vector<float> points{x0 * sx, y0 * sy, x1 * sx, y1 * sy};
         std::vector<int64_t> labels{2, 3};
         const int budget = std::max(0, refinePoints_ - 2);
@@ -281,47 +313,48 @@ public:
         const float* logits = out[0].data.data();
         int mx0 = g.width, my0 = g.height, mx1 = -1, my1 = -1;
         std::vector<uint8_t> full(static_cast<size_t>(g.width) * g.height, 0);
+        // 255 = predicted, 1 = weak support only (see smoothMask).
+        bool any = false;
         for (int y = 0; y < g.height; ++y) {
             const float fy = (y + .5f) * maskSize_ / g.height - .5f;
             for (int x = 0; x < g.width; ++x) {
-                const bool on = bilinearSample(logits, maskSize_, maskSize_, (x + .5f) * maskSize_ / g.width - .5f, fy) > 0 ||
-                                (!replace && inCurrent(x, y));
-                if (!on) continue;
-                full[static_cast<size_t>(y) * g.width + x] = 255;
+                const float logit = bilinearSample(logits, maskSize_, maskSize_, (x + .5f) * maskSize_ / g.width - .5f, fy);
+                const bool on = logit > 0 || (!replace && inCurrent(x, y));
+                const bool weak = logit > SupportLogit || (!replace && currentSupport(current, x, y));
+                if (!on && !weak) continue;
+                full[static_cast<size_t>(y) * g.width + x] = on ? 255 : 1;
+                any = any || on;
                 mx0 = std::min(mx0, x); my0 = std::min(my0, y); mx1 = std::max(mx1, x); my1 = std::max(my1, y);
             }
             if ((y & 63) == 0) checkCancel(cancel);
         }
-        if (mx1 < 0) return false;
+        if (!any) return false;
         current.left = mx0; current.top = my0; current.width = mx1 - mx0 + 1; current.height = my1 - my0 + 1;
         current.box = {static_cast<float>(mx0), static_cast<float>(my0), mx1 + 1.f, my1 + 1.f};
-        current.mask.assign(static_cast<size_t>(current.width) * current.height, 0);
-        for (int y = 0; y < current.height; ++y)
-            std::copy_n(&full[static_cast<size_t>(y + my0) * g.width + mx0], current.width,
-                        &current.mask[static_cast<size_t>(y) * current.width]);
+        splitSupport(current, [&](int x, int y) { return full[static_cast<size_t>(y + my0) * g.width + x + mx0]; });
         current.refined = true;
         return true;
     }
     Json describeModel() const override {
         return {{"modelName", manifest_.value("modelName", "SAM 3.1")}, {"architecture", "sam3"},
                 {"promptKind", "visual"}, {"resample", resampleName(resample_)}, {"promptSampling", "component-boxes-v1"},
-                {"maxPrompts", maxPrompts_}};
+                {"maxPrompts", maxPrompts_}, {"inputSize", size_}, {"maskSize", maskSize_}};
     }
     std::vector<float> preprocess(const uint8_t* rgba, size_t length, int width, int height, Geometry& g) const override {
         const size_t count = pixels(width, height);
         if (!rgba || length != count * 4) throw Error("BUFFER_SIZE", "Expected document-sized RGBA buffer");
-        g = {width, height, Size, Size, 0, 0, 1.f};
-        std::vector<float> input(3 * static_cast<size_t>(Size) * Size);
-        resampleComposite(rgba, width, height, Size, Size, resample_, input.data(), Size, static_cast<size_t>(Size) * Size, 0, 0);
+        g = {width, height, size_, size_, 0, 0, 1.f};
+        std::vector<float> input(3 * static_cast<size_t>(size_) * size_);
+        resampleComposite(rgba, width, height, size_, size_, resample_, input.data(), size_, static_cast<size_t>(size_) * size_, 0, 0);
         for (float& value : input) value = (value - 127.5f) / 127.5f;
         return input;
     }
     std::vector<Tensor> encode(std::vector<float>& input) override {
         std::vector<Ort::Value> inputs;
-        inputs.push_back(tensor(input.data(), input.size(), {1, 3, Size, Size}));
+        inputs.push_back(tensor(input.data(), input.size(), {1, 3, size_, size_}));
         // The interactive neck outputs (iembed, ifeat0, ifeat1) feed refine(); bundles without it stop at fpn2.
-        if (hasRefine_) return run(*image_, {"image"}, inputs, {"fpn0", "fpn1", "fpn2", "iembed", "ifeat0", "ifeat1"});
-        return run(*image_, {"image"}, inputs, {"fpn0", "fpn1", "fpn2"});
+        if (hasRefine_) return run(encoder(), {"image"}, inputs, {"fpn0", "fpn1", "fpn2", "iembed", "ifeat0", "ifeat1"});
+        return run(encoder(), {"image"}, inputs, {"fpn0", "fpn1", "fpn2"});
     }
     std::vector<Instance> segment(const Session& session, const uint8_t* alpha, const uint8_t*, size_t length,
                                   const SegmentOptions& options, Json& diagnostics, const std::atomic_bool* cancel) override {
@@ -416,17 +449,23 @@ public:
             if (x1 <= x0 || y1 <= y0) continue;
             const float* logits = &masks[static_cast<size_t>(q) * maskSize_ * maskSize_];
             // Bilinear upsample of logits to document resolution, then threshold (F.interpolate, align_corners=False).
-            std::vector<uint8_t> full(static_cast<size_t>(x1 - x0) * (y1 - y0));
+            // Weak logits are kept as support for gap closing (see smoothMask).
+            const int fw = x1 - x0;
+            std::vector<uint8_t> full(static_cast<size_t>(fw) * (y1 - y0)), weak(full.size());
             int mx0 = x1, my0 = y1, mx1 = x0 - 1, my1 = y0 - 1;
             size_t intersection = 0, nonzero = 0;
             for (int y = y0; y < y1; ++y) {
                 const float sy = (y + .5f) * maskSize_ / g.height - .5f;
                 for (int x = x0; x < x1; ++x) {
-                    if (bilinearSample(logits, maskSize_, maskSize_, (x + .5f) * maskSize_ / g.width - .5f, sy) <= 0) continue;
-                    full[static_cast<size_t>(y - y0) * (x1 - x0) + (x - x0)] = 255;
+                    const float logit = bilinearSample(logits, maskSize_, maskSize_, (x + .5f) * maskSize_ / g.width - .5f, sy);
+                    if (logit <= SupportLogit) continue;
+                    const size_t i = static_cast<size_t>(y - y0) * fw + (x - x0);
+                    weak[i] = 1;
+                    mx0 = std::min(mx0, x); my0 = std::min(my0, y); mx1 = std::max(mx1, x); my1 = std::max(my1, y);
+                    if (logit <= 0) continue;
+                    full[i] = 255;
                     ++nonzero;
                     intersection += alpha[static_cast<size_t>(y) * g.width + x] > 0;
-                    mx0 = std::min(mx0, x); my0 = std::min(my0, y); mx1 = std::max(mx1, x); my1 = std::max(my1, y);
                 }
             }
             if (!nonzero) continue;
@@ -434,9 +473,12 @@ public:
             const size_t maskBytes = static_cast<size_t>(instance.width) * instance.height;
             if (maskBytes > 400000000 - resultBytes) throw Error("RESULT_TOO_LARGE", "Masks exceed 400 MB; increase confidence");
             instance.mask.resize(maskBytes);
-            for (int y = 0; y < instance.height; ++y)
-                std::copy_n(&full[static_cast<size_t>(y + my0 - y0) * (x1 - x0) + (mx0 - x0)], instance.width,
-                            &instance.mask[static_cast<size_t>(y) * instance.width]);
+            instance.support.resize(maskBytes);
+            for (int y = 0; y < instance.height; ++y) {
+                const size_t from = static_cast<size_t>(y + my0 - y0) * fw + (mx0 - x0), to = static_cast<size_t>(y) * instance.width;
+                std::copy_n(&full[from], instance.width, &instance.mask[to]);
+                std::copy_n(&weak[from], instance.width, &instance.support[to]);
+            }
             instance.overlap = static_cast<float>(intersection) / std::max<size_t>(1, stats.painted);
             resultBytes += maskBytes;
             result.push_back(std::move(instance));
@@ -447,16 +489,17 @@ private:
     std::filesystem::path directory_;
     Json manifest_;
     Resample resample_;
-    int maxPrompts_ = 0, queries_ = 0, maskSize_ = 0, refinePoints_ = 20;
+    int size_ = 1008, maxPrompts_ = 0, queries_ = 0, maskSize_ = 0, refinePoints_ = 20;
     float nmsIou_ = .7f;
     bool hasRefine_ = false;
     std::unique_ptr<Ort::Session> image_, prompt_, refine_;
+    int device_ = -1;
 
     // Samples a stroke as point prompts: one point per occupied cell of a coarse grid (about 24
     // model pixels), at the painted pixel nearest the cell's centroid, most-painted cells first.
     template <class Painted>
-    static std::vector<std::array<float, 3>> cellCentres(const Geometry& g, Painted painted) {
-        const int cell = std::max(1, static_cast<int>(std::ceil(24.f * std::max(g.width, g.height) / Size)));
+    std::vector<std::array<float, 3>> cellCentres(const Geometry& g, Painted painted) {
+        const int cell = std::max(1, static_cast<int>(std::ceil(24.f * std::max(g.width, g.height) / size_)));
         const int cols = (g.width + cell - 1) / cell, rows = (g.height + cell - 1) / cell;
         struct Acc { double x = 0, y = 0; size_t n = 0; };
         std::vector<Acc> acc(static_cast<size_t>(cols) * rows);

@@ -382,3 +382,89 @@ test("Photoshop 24.x without Selection.bounds / deselect() keeps the user's sele
   expect(mock.calls).toEqual(["deselect"]);
   expect(mock.selection).toBeNull();
 });
+
+test("showing the marks never reveals the user's own hidden layers", async () => {
+  const mock = photoshop();
+  mock.prompt.move = (target: any) => { mock.doc.layers.splice(mock.doc.layers.indexOf(mock.prompt), 1); target.layers.unshift(mock.prompt); mock.prompt.parent = target; };
+  const userLayer: any = { id: 40, name: "A", visible: false, kind: "pixel" };
+  mock.doc.layers.splice(1, 0, userLayer);
+  await mock.host.beginMarking("add");
+  const group = mock.doc.layers.find((l: any) => l.name.startsWith("[SAMPS 标记]"));
+  // Like Photoshop applying a visibility change to every selected layer.
+  let groupVisible = group.visible;
+  Object.defineProperty(group, "visible", { get: () => groupVisible, set(value: boolean) { groupVisible = value; userLayer.visible = value; } });
+  await mock.host.setVisibility("marks", false);
+  userLayer.visible = false;
+  await mock.host.setVisibility("marks", true);
+  expect(group.visible).toBe(true);
+  expect(userLayer.visible).toBe(false);
+  await mock.host.beginMarking("exclude");
+  expect(userLayer.visible).toBe(false);
+});
+
+test("the marking brush is set to 50% opacity and the eraser to 100%, keeping other options", async () => {
+  const mock = photoshop();
+  mock.prompt.move = (target: any) => { mock.doc.layers.splice(mock.doc.layers.indexOf(mock.prompt), 1); target.layers.unshift(mock.prompt); };
+  const options: any = { _obj: "currentToolOptions", opacity: 100, flow: 37, brush: { _obj: "computedBrush", diameter: 12 } };
+  const sets: any[] = [];
+  const batchPlay = mock.ps.action.batchPlay;
+  mock.ps.action.batchPlay = async (commands: any[]) => {
+    for (const c of commands) {
+      if (c._obj === "get" && c._target?.[0]?._property === "currentToolOptions") return [{ currentToolOptions: { ...options } }];
+      if (c._obj === "set" && c.to?._obj === "currentToolOptions") { sets.push(c); Object.assign(options, c.to); return [{}]; }
+    }
+    return batchPlay(commands);
+  };
+  await mock.host.beginMarking("add", "brush");
+  expect(sets.at(-1)._target[0]._ref).toBe("paintbrushTool");
+  expect(sets.at(-1).to).toMatchObject({ opacity: 50, flow: 37, brush: { diameter: 12 } });
+  await mock.host.beginMarking("add", "brush");
+  expect(sets).toHaveLength(1);  // already 50%: no redundant set
+  await mock.host.beginMarking("add", "eraser");
+  expect(sets.at(-1)).toMatchObject({ _target: [{ _ref: "eraserTool" }], to: { opacity: 100 } });
+});
+
+test("preview history steps are named for creating and removing the preview", async () => {
+  const mock = photoshop();
+  const names: string[] = [];
+  const executeAsModal = mock.ps.core.executeAsModal;
+  mock.ps.core.executeAsModal = (fn: any, options: any) => { names.push(options.commandName); return executeAsModal(fn, options); };
+  const batchPlay = mock.ps.action.batchPlay;
+  mock.ps.action.batchPlay = async (commands: any[]) => {
+    for (const c of commands) if (c._obj === "make" && c._target?.[0]?._ref === "contentLayer") {
+      const layer: any = { id: 80, name: c.using.name, visible: true, kind: "solidColor" };
+      layer.delete = () => mock.doc.layers.splice(mock.doc.layers.indexOf(layer), 1);
+      mock.doc.layers.unshift(layer);
+      return [];
+    }
+    return batchPlay(commands);
+  };
+  const snapshot = await mock.host.capture();
+  snapshot.stamp = await mock.host.showPreview(snapshot, [instance]);
+  await mock.host.showPreview(snapshot, []);
+  expect(names.slice(-2)).toEqual(["SAMPS 创建预览", "SAMPS 删除预览"]);
+});
+
+test("large-document selection reads skip strips without selected pixels", async () => {
+  // 4 rows × 2 columns, read in 1-row strips at half size; only row 3 is selected.
+  const W = 2, H = 4, plane = Uint8Array.of(0, 0, 0, 0, 0, 0, 200, 0);
+  const regions: number[][] = [];
+  const doc: any = { id: 1, width: W, height: H, selection: { bounds: { left: 0, top: 3, right: 1, bottom: 4 } } };
+  const ps: any = { app: { documents: [doc], activeDocument: doc }, action: { batchPlay: async () => [] }, imaging: {
+    async getSelection({ sourceBounds: b }: any) {
+      regions.push([b.left, b.top, b.right, b.bottom]);
+      const rows: number[] = [];
+      for (let y = b.top; y < b.bottom; y++) for (let x = b.left; x < b.right; x++) rows.push(plane[y * W + x]);
+      if (!rows.some(v => v)) throw new Error("Invalid Source Bounds");
+      return { sourceBounds: b, imageData: { width: b.right - b.left, height: b.bottom - b.top, components: 1, componentSize: 8,
+        async getData() { return Uint8Array.from(rows); }, dispose() {} } };
+    } } };
+  const host = new PhotoshopHost(ps);
+  const out = await host.readSelectionAt(doc, { width: 1, height: 2 });
+  expect([...out]).toEqual([0, 200]);
+  expect(regions.every(([, top]) => top >= 3)).toBe(true);  // rows above the selection are never requested
+  // Without bounds every strip is tried, and empty ones are skipped instead of failing.
+  doc.selection = {}; regions.length = 0;
+  ps.action.batchPlay = async () => [{ selection: { _obj: "rectangle" } }];
+  expect([...await host.readSelectionAt(doc, { width: 1, height: 2 })]).toEqual([0, 200]);
+});

@@ -16,7 +16,7 @@ try {
         $taskTargets = @("samps")
     } else {
         $taskArgs += @("-DUXP_SDK_ROOT=", "-DSAMPS_BUILD_HYBRID=OFF", "-DBUILD_TESTING=ON")
-        $taskTargets = @("samps_validation", "samps_behavior", "samps_prompt")
+        $taskTargets = @("samps_validation", "samps_behavior", "samps_prompt", "samps_postprocess")
     }
     & cmake @taskArgs
     if ($LASTEXITCODE -ne 0) { throw "CMake configure failed." }

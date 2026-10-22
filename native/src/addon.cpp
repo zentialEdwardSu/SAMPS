@@ -2,6 +2,7 @@
 // JS polls completion on its own scripting queue; no cross-thread V8 handles.
 #include "samps/engine.h"
 #include "UxpAddon.h"
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -36,6 +37,34 @@ addon_value jsString(addon_env env,const std::string& text) {
     check(UxpAddonApis.uxp_addon_create_string_utf8(env,text.c_str(),text.size(),&value));
     return value;
 }
+// Panel smoothing sliders, 0..1 each; non-numbers fall back to the defaults.
+samps::SmoothParams smoothing(const Json& options) {
+    samps::SmoothParams params;
+    auto read = [&](const char* key, float& target) {
+        if (options.contains(key) && options.at(key).is_number()) target = std::clamp(options.at(key).get<float>(), 0.f, 1.f);
+    };
+    read("smooth", params.smooth); read("expand", params.expand);
+    return params;
+}
+
+// Serializes instances: descriptors in JSON, masks concatenated into `bytes`.
+Json pack(const std::vector<samps::Instance>& instances, std::vector<uint8_t>& bytes) {
+    size_t total = 0;
+    for (const auto& item : instances) {
+        if (item.mask.size() > 400000000-total) throw samps::Error("RESULT_TOO_LARGE", "Too many large masks; increase confidence");
+        total += item.mask.size();
+    }
+    bytes.clear(); bytes.reserve(total);
+    Json result = Json::array();
+    for (const auto& item : instances) {
+        auto value = samps::describe(item);
+        value["offset"] = bytes.size(); value["length"] = item.mask.size();
+        bytes.insert(bytes.end(),item.mask.begin(),item.mask.end());
+        result.push_back(value);
+    }
+    return {{"instances",result},{"prompt",engine->promptDiagnostics()},{"resultId",engine->resultId()}};
+}
+
 addon_value submit(addon_env env, addon_callback_info callback) {
     try {
         if (job) throw samps::Error("BUSY", "Wait for or cancel the current request");
@@ -59,8 +88,14 @@ addon_value submit(addon_env env, addon_callback_info callback) {
                     auto candidate = std::make_unique<samps::Engine>();
                     const int device = options.contains("device") && options.at("device").is_number_integer()
                         ? options.at("device").get<int>() : -2;
+                    samps::LoadOptions load;
+                    load.lowVram = options.contains("lowVram") && options.at("lowVram").is_boolean() && options.at("lowVram").get<bool>();
+                    if (options.contains("optimization") && options.at("optimization").is_string())
+                        load.optimization = options.at("optimization").get<std::string>();
+                    if (options.contains("inputSize") && options.at("inputSize").is_number_integer())
+                        load.inputSize = options.at("inputSize").get<int>();
                     auto info = candidate->initialize(std::filesystem::u8path(options.at("directory").get<std::string>()),
-                        device,options.value("allowUnvalidated",false));
+                        device,options.value("allowUnvalidated",false),load);
                     if (state->cancelled) throw samps::Error("CANCELLED", "Operation cancelled");
                     engine = std::move(candidate);
                     state->result = {{"ok",true},{"value",info}};
@@ -77,21 +112,20 @@ addon_value submit(addon_env env, addon_callback_info callback) {
                     config.currentOnly = options.value("mode",std::string("current")) == "current";
                     config.hasNegative = options.value("hasNegative",false);
                     config.detail = options.value("detail",true);
+                    config.smoothing = smoothing(options);
                     auto instances = engine->segment(*session,input.data(),input.size(),config,&state->cancelled);
-                    Json result = Json::array();
-                    size_t total = 0;
-                    for (const auto& item : instances) {
-                        if (item.mask.size() > 400000000-total) throw samps::Error("RESULT_TOO_LARGE", "Too many large masks; increase confidence");
-                        total += item.mask.size();
-                    }
-                    state->bytes.reserve(total);
-                    for (const auto& item : instances) {
-                        auto value = samps::describe(item);
-                        value["offset"] = state->bytes.size(); value["length"] = item.mask.size();
-                        state->bytes.insert(state->bytes.end(),item.mask.begin(),item.mask.end());
-                        result.push_back(value);
-                    }
-                    state->result = {{"ok",true},{"value",{{"instances",result},{"prompt",engine->promptDiagnostics()}}}};
+                    state->result = {{"ok",true},{"value",pack(instances,state->bytes)}};
+                } else if (operation == "resmooth") {
+                    if (!engine) throw samps::Error("NOT_INITIALIZED", "Choose an offline model bundle first");
+                    if (!session || session->id != options.at("sessionId").get<uint64_t>()) throw samps::Error("STALE_SESSION", "Image session expired");
+                    auto instances = engine->resmooth(*session,options.at("resultId").get<uint64_t>(),smoothing(options),&state->cancelled);
+                    state->result = {{"ok",true},{"value",pack(instances,state->bytes)}};
+                } else if (operation == "unload") {
+                    // Destroying the engine destroys its ORT sessions, which is the only way to
+                    // return DirectML's allocation arena. initialize() loads the model again.
+                    session.reset();
+                    engine.reset();
+                    state->result = {{"ok",true},{"value",nullptr}};
                 } else if (operation == "dispose") {
                     if (session && session->id == options.at("sessionId").get<uint64_t>()) session.reset();
                     state->result = {{"ok",true},{"value",nullptr}};
@@ -99,6 +133,9 @@ addon_value submit(addon_env env, addon_callback_info callback) {
                 if (state->cancelled) throw samps::Error("CANCELLED", "Operation cancelled");
             } catch (const samps::Error& error) {
                 state->result = {{"ok",false},{"code",error.code},{"message",error.what()}}; state->bytes.clear();
+                // A removed GPU device leaves every session unusable; drop them so the next request
+                // reloads, and so their memory is returned.
+                if (error.code == "GPU_LOST") { session.reset(); engine.reset(); state->result["unloaded"] = true; }
             } catch (const std::exception& error) {
                 state->result = {{"ok",false},{"code","NATIVE_ERROR"},{"message",error.what()}}; state->bytes.clear();
             } catch (...) {

@@ -1,8 +1,10 @@
 import { describe, expect, test } from "vitest";
 import { combineSelection, modeFromModifiers } from "../src/core/selection";
-import { expandGray, expandPixels, mergeMasks } from "../src/core/pixels";
+import { documentMask, downsampleMax, expandGray, expandPixels, mergeMasks, RgbaDownsampler } from "../src/core/pixels";
 import { labToSrgb, labPixelsToRgba } from "../src/core/color";
-import { assertFresh } from "../src/core/document";
+import { assertDocument, assertFresh, workSize } from "../src/core/document";
+import { ResultsHistory } from "../src/ui/history";
+import { gpuFailureText, isGpuFailure, lighterOption } from "../src/ui/lighter";
 
 describe("combineSelection", () => {
   const S = Uint8Array.of(0, 255, 255, 128, 0);
@@ -109,5 +111,97 @@ describe("selection settings", () => {
   test("describes contraction and feathering", () => {
     expect(describeSettings({ expand: -2, feather: 0 })).toBe("收缩 2 像素");
     expect(describeSettings({ expand: 0, feather: 0 })).toBe("");
+  });
+});
+
+describe("soft masks", () => {
+  test("overlapping soft edges merge by maximum, not bitwise or", () => {
+    const a = { left: 0, top: 0, width: 2, height: 1, mask: Uint8Array.of(128, 64) };
+    const b = { left: 1, top: 0, width: 2, height: 1, mask: Uint8Array.of(129, 255) };
+    expect([...mergeMasks([a, b], 3, 1)]).toEqual([128, 129, 255]);
+  });
+});
+
+describe("results history", () => {
+  const stamp = (historyId: number, documentId = 1) => ({ documentId, historyId, width: 2, height: 1 });
+  const capture = (rgba: Uint8Array) => ({ rgba, alpha: new Uint8Array(2), exclude: null, width: 2, height: 1, promptId: 1,
+    promptRead: {}, captureMethod: "", stamp: stamp(0) });
+  const item = { id: 5, left: 0, top: 0, width: 1, height: 1, confidence: .9, overlap: 1, offset: 0, length: 1, mask: Uint8Array.of(255), box: [0, 0, 1, 1] } as any;
+  test("undo and redo find the results recorded for a history state", () => {
+    const history = new ResultsHistory();
+    const image = new Uint8Array(8);
+    history.record(stamp(10), { instances: [], selected: [], snapshot: null });
+    history.record(stamp(11), { instances: [item], selected: [5], snapshot: capture(image) });
+    history.record(stamp(12), { instances: [item], selected: [], snapshot: capture(image) });
+    expect(history.get(stamp(10))).toEqual({ instances: [], selected: [], snapshot: null });
+    expect(history.get(stamp(11))!.selected).toEqual([5]);
+    expect(history.get(stamp(11))!.snapshot!.stamp).toEqual(stamp(11));
+    expect(history.get(stamp(12))!.selected).toEqual([]);
+    expect(history.get(stamp(11, 2))).toBeUndefined();
+    expect(history.get({ ...stamp(11), width: 3 })).toBeUndefined();
+  });
+  test("only the newest images are kept alive", () => {
+    const history = new ResultsHistory(64, 2);
+    const images = [new Uint8Array(8), new Uint8Array(8), new Uint8Array(8)];
+    images.forEach((image, i) => history.record(stamp(i), { instances: [item], selected: [5], snapshot: capture(image) }));
+    expect(history.get(stamp(0))).toBeUndefined();
+    expect(history.get(stamp(1))).toBeDefined();
+    expect(history.get(stamp(2))).toBeDefined();
+  });
+});
+
+describe("large documents", () => {
+  test("documents up to 64 MP are processed at full size; larger ones at a working size", () => {
+    expect(workSize(8000, 6000)).toEqual({ width: 8000, height: 6000 });
+    const gfx = workSize(11648, 8736);  // 102 MP medium format
+    expect(gfx.width * gfx.height).toBeLessThanOrEqual(64_000_000);
+    expect(Math.abs(gfx.width / gfx.height - 11648 / 8736)).toBeLessThan(.001);
+    const pano = workSize(60000, 8000);  // wider than the native 30000 px side limit
+    expect(pano.width).toBeLessThanOrEqual(30000);
+  });
+  test("150 MP documents pass the size check, 1 GP does not", () => {
+    const doc = (width: number, height: number) => ({ id: 1, width, height, activeHistoryState: { id: 1 } });
+    expect(() => assertDocument(doc(14204, 10652))).not.toThrow();
+    expect(() => assertDocument(doc(40000, 30000))).toThrow();
+  });
+  test("strokes survive a max downsample; colour is box-averaged over white", () => {
+    const plane = new Uint8Array(16); plane[5] = 200;  // one painted pixel in a 4×4 plane
+    expect([...downsampleMax(plane, 4, 4, 2, 2)]).toEqual([200, 0, 0, 0]);
+    const rgba = new Uint8Array(4 * 2 * 4);
+    for (let i = 0; i < 8; i++) rgba.set(i % 2 ? [0, 0, 0, 255] : [255, 255, 255, 0], i * 4);
+    const sampler = new RgbaDownsampler(4, 2, 2, 1);
+    sampler.push(rgba.subarray(0, 16), 0, 1); sampler.push(rgba.subarray(16), 1, 1);
+    expect([...sampler.finish()]).toEqual([128, 128, 128, 255, 128, 128, 128, 255]);
+  });
+  test("working-size masks are scaled to the document only around the instances", () => {
+    const item = { left: 1, top: 1, width: 1, height: 1, mask: Uint8Array.of(255) };
+    const out = documentMask([item], { width: 4, height: 4 }, { width: 8, height: 8 });
+    expect(out[3 * 8 + 3]).toBeGreaterThan(128);
+    expect(out[0]).toBe(0); expect(out[7 * 8 + 7]).toBe(0);
+    expect(out.some(value => value > 0 && value < 255)).toBe(true);  // interpolated edge
+    expect(documentMask([item], { width: 4, height: 4 }, { width: 4, height: 4 })[5]).toBe(255);
+  });
+});
+
+describe("GPU memory failures", () => {
+  test("suggest releasing the encoder first, then smaller SAM 3 inputs, then YOLOE", () => {
+    expect(lighterOption("sam3", false)).toEqual({ kind: "release" });
+    expect(lighterOption("sam3", true)).toMatchObject({ kind: "model", model: { id: "sam3-840" } });
+    expect(lighterOption("sam3-840", true)).toMatchObject({ kind: "model", model: { id: "sam3-672" } });
+    expect(lighterOption("sam3-672", true)).toMatchObject({ kind: "model", model: { id: "yoloe26x" } });
+    expect(lighterOption("yoloe26x", true)).toBeNull();
+    expect(lighterOption("yoloe26x", false)).toBeNull();
+  });
+  test("only out-of-memory and device-lost errors count", () => {
+    expect(isGpuFailure({ code: "GPU_MEMORY" })).toBe(true);
+    expect(isGpuFailure({ code: "GPU_LOST" })).toBe(true);
+    expect(isGpuFailure({ code: "INFERENCE_FAILED" })).toBe(false);
+    expect(isGpuFailure(null)).toBe(false);
+  });
+  test("messages name the stage and the suggested model", () => {
+    const next = lighterOption("sam3-840", true);
+    expect(gpuFailureText({ code: "GPU_MEMORY" }, "识别", next)).toContain("SAM 3.1 · 672 px");
+    expect(gpuFailureText({ code: "GPU_LOST" }, "识别", next)).toContain("模型已卸载");
+    expect(gpuFailureText({ code: "GPU_MEMORY" }, "加载模型", null)).toContain("最轻量");
   });
 });

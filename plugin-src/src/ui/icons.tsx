@@ -43,6 +43,10 @@ export const ClearIcon = () => (
 export const FolderIcon = () => (
   <Svg><path d="M2 4.5h5l1.5 1.5H16v8H2z" {...stroke} /></Svg>
 );
+// Power symbol: unload / load the model.
+export const PowerIcon = () => (
+  <Svg><path d="M9 2.5v6" {...stroke} strokeWidth={1.5} /><path d="M5.6 4.8a5.5 5.5 0 1 0 6.8 0" {...stroke} strokeWidth={1.5} /></Svg>
+);
 export const InfoIcon = () => (
   <Svg><circle cx="9" cy="9" r="6.5" {...stroke} /><path d="M9 8v4.5M9 5.5v1" {...stroke} /></Svg>
 );

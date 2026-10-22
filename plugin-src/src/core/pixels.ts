@@ -71,8 +71,127 @@ export function expandGray(data: Samples, info: PixelInfo, bounds: Bounds, width
   return output;
 }
 
+// Target bin of every source column / row for a box downsample.
+function bins(source: number, target: number): Int32Array {
+  const out = new Int32Array(source);
+  for (let i = 0; i < source; i++) out[i] = Math.min(target - 1, Math.floor(i * target / source));
+  return out;
+}
+
+/**
+ * Box-downsamples full-width 8-bit RGBA rows, fed top to bottom in strips, into a smaller
+ * canvas. Pixels are composited over white first (as the models do), so the output is opaque.
+ */
+export class RgbaDownsampler {
+  readonly output: Uint8Array;
+  private columns: Int32Array;
+  private sum: Float64Array;
+  private count: Uint32Array;
+  private row = -1;
+  constructor(private sourceWidth: number, private sourceHeight: number, private width: number, private height: number) {
+    this.output = new Uint8Array(width * height * 4);
+    this.columns = bins(sourceWidth, width);
+    this.sum = new Float64Array(width * 3);
+    this.count = new Uint32Array(width);
+  }
+  /** `rows` holds `count` full-width rows starting at source row `top`. */
+  push(rows: Uint8Array, top: number, count: number) {
+    const { columns, sum, sourceWidth } = this;
+    for (let y = 0; y < count; y++) {
+      const target = Math.min(this.height - 1, Math.floor((top + y) * this.height / this.sourceHeight));
+      if (target !== this.row) { this.flush(); this.row = target; }
+      let i = y * sourceWidth * 4;
+      for (let x = 0; x < sourceWidth; x++, i += 4) {
+        const t = columns[x], a = rows[i + 3], white = 255 - a;
+        sum[t * 3] += rows[i] * a / 255 + white;
+        sum[t * 3 + 1] += rows[i + 1] * a / 255 + white;
+        sum[t * 3 + 2] += rows[i + 2] * a / 255 + white;
+        this.count[t]++;
+      }
+    }
+  }
+  finish(): Uint8Array { this.flush(); return this.output; }
+  private flush() {
+    if (this.row < 0) return;
+    const base = this.row * this.width * 4;
+    for (let t = 0; t < this.width; t++) {
+      const n = this.count[t] || 1, o = base + t * 4;
+      this.output[o] = Math.round(this.sum[t * 3] / n);
+      this.output[o + 1] = Math.round(this.sum[t * 3 + 1] / n);
+      this.output[o + 2] = Math.round(this.sum[t * 3 + 2] / n);
+      this.output[o + 3] = 255;
+    }
+    this.sum.fill(0); this.count.fill(0);
+  }
+}
+
+/**
+ * Downsamples full-width gray rows, fed in strips, keeping each bin's maximum so thin brush
+ * strokes survive the reduction.
+ */
+export class GrayMaxDownsampler {
+  readonly output: Uint8Array;
+  private columns: Int32Array;
+  constructor(private sourceWidth: number, private sourceHeight: number, private width: number, private height: number) {
+    this.output = new Uint8Array(width * height);
+    this.columns = bins(sourceWidth, width);
+  }
+  push(rows: Uint8Array, top: number, count: number) {
+    for (let y = 0; y < count; y++) {
+      const target = Math.min(this.height - 1, Math.floor((top + y) * this.height / this.sourceHeight)) * this.width;
+      const source = y * this.sourceWidth;
+      for (let x = 0; x < this.sourceWidth; x++) {
+        const value = rows[source + x], t = target + this.columns[x];
+        if (value > this.output[t]) this.output[t] = value;
+      }
+    }
+  }
+}
+
+export function downsampleMax(plane: Uint8Array, sourceWidth: number, sourceHeight: number, width: number, height: number): Uint8Array {
+  if (width === sourceWidth && height === sourceHeight) return plane;
+  const sampler = new GrayMaxDownsampler(sourceWidth, sourceHeight, width, height);
+  sampler.push(plane, 0, sourceHeight);
+  return sampler.output;
+}
+
 export interface MaskInstance { left: number; top: number; width: number; height: number; mask: Uint8Array }
 
+/**
+ * Merges masks found at working size and scales them to the document with bilinear filtering.
+ * Only the instances' bounds are interpolated; the rest of the document stays unselected.
+ */
+export function documentMask(instances: MaskInstance[], work: { width: number; height: number },
+  doc: { width: number; height: number }): Uint8Array {
+  const merged = mergeMasks(instances, work.width, work.height);
+  if (work.width === doc.width && work.height === doc.height) return merged;
+  const output = new Uint8Array(doc.width * doc.height);
+  if (!instances.length) return output;
+  const sx = work.width / doc.width, sy = work.height / doc.height;
+  const left = Math.min(...instances.map(item => item.left)), top = Math.min(...instances.map(item => item.top));
+  const right = Math.max(...instances.map(item => item.left + item.width)), bottom = Math.max(...instances.map(item => item.top + item.height));
+  const x0 = Math.max(0, Math.floor(left / sx) - 1), x1 = Math.min(doc.width, Math.ceil(right / sx) + 1);
+  const y0 = Math.max(0, Math.floor(top / sy) - 1), y1 = Math.min(doc.height, Math.ceil(bottom / sy) + 1);
+  // Per document column: the two working columns and the weight of the right one.
+  const columnA = new Int32Array(x1 - x0), columnB = new Int32Array(x1 - x0), columnW = new Float32Array(x1 - x0);
+  for (let x = x0; x < x1; x++) {
+    const f = Math.min(work.width - 1, Math.max(0, (x + .5) * sx - .5)), a = Math.floor(f);
+    columnA[x - x0] = a; columnB[x - x0] = Math.min(work.width - 1, a + 1); columnW[x - x0] = f - a;
+  }
+  for (let y = y0; y < y1; y++) {
+    const f = Math.min(work.height - 1, Math.max(0, (y + .5) * sy - .5)), a = Math.floor(f), wy = f - a;
+    const rowA = a * work.width, rowB = Math.min(work.height - 1, a + 1) * work.width, target = y * doc.width;
+    for (let x = x0; x < x1; x++) {
+      const i = x - x0, wx = columnW[i];
+      const upper = merged[rowA + columnA[i]] * (1 - wx) + merged[rowA + columnB[i]] * wx;
+      const lower = merged[rowB + columnA[i]] * (1 - wx) + merged[rowB + columnB[i]] * wx;
+      output[target + x] = Math.round(upper * (1 - wy) + lower * wy);
+    }
+  }
+  return output;
+}
+
+/** Unions cropped masks into a full-canvas plane; soft (0..255) edges combine by maximum. */
 export function mergeMasks(instances: MaskInstance[], width: number, height: number): Uint8Array {
   const output = new Uint8Array(width * height);
   for (const item of instances) {
@@ -82,7 +201,10 @@ export function mergeMasks(instances: MaskInstance[], width: number, height: num
     }
     for (let y = 0; y < item.height; y++) {
       const source = y * item.width, target = (y + item.top) * width + item.left;
-      for (let x = 0; x < item.width; x++) output[target + x] |= item.mask[source + x];
+      for (let x = 0; x < item.width; x++) {
+        const value = item.mask[source + x];
+        if (value > output[target + x]) output[target + x] = value;
+      }
     }
   }
   return output;

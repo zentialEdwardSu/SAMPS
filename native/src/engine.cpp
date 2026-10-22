@@ -56,11 +56,16 @@ Instance mergeInstances(std::vector<Instance>& parts) {
     merged.parts = static_cast<int>(parts.size());
     merged.box = {static_cast<float>(x0), static_cast<float>(y0), static_cast<float>(x1), static_cast<float>(y1)};
     merged.mask.assign(static_cast<size_t>(merged.width) * merged.height, 0);
+    const bool support = std::any_of(parts.begin(), parts.end(), [](const auto& p) { return !p.support.empty(); });
+    if (support) merged.support.assign(merged.mask.size(), 0);
     for (const auto& p : parts)
         for (int y = 0; y < p.height; ++y) {
-            const uint8_t* source = &p.mask[static_cast<size_t>(y) * p.width];
-            uint8_t* target = &merged.mask[static_cast<size_t>(y + p.top - y0) * merged.width + (p.left - x0)];
-            for (int x = 0; x < p.width; ++x) target[x] |= source[x];
+            const size_t row = static_cast<size_t>(y) * p.width;
+            const size_t target = static_cast<size_t>(y + p.top - y0) * merged.width + (p.left - x0);
+            for (int x = 0; x < p.width; ++x) {
+                merged.mask[target + x] |= p.mask[row + x];
+                if (support) merged.support[target + x] |= supportAt(p, row + x) ? 1 : 0;
+            }
         }
     return merged;
 }
@@ -104,7 +109,8 @@ std::pair<size_t, size_t> cleanMask(Instance& item, size_t area) {
     size_t holes = 0;
     for (size_t k = 0; k < background.size(); ++k)
         if (!background[k].border && background[k].size < area) { fill[k] = 1; ++holes; }
-    for (size_t i = 0; i < n; ++i) if (!item.mask[i] && fill[label[i]]) item.mask[i] = 255;
+    for (size_t i = 0; i < n; ++i)
+        if (!item.mask[i] && fill[label[i]]) { item.mask[i] = 255; if (!item.support.empty()) item.support[i] = 1; }
     // Islands: small foreground pieces apart from the largest one.
     auto foreground = components(true);
     size_t largest = 0;
@@ -113,22 +119,32 @@ std::pair<size_t, size_t> cleanMask(Instance& item, size_t area) {
     size_t islands = 0;
     for (size_t k = 0; k < foreground.size(); ++k)
         if (k != largest && foreground[k].size < area) { drop[k] = 1; ++islands; }
-    for (size_t i = 0; i < n; ++i) if (item.mask[i] && drop[label[i]]) item.mask[i] = 0;
-    // Re-crop to the cleaned mask.
-    int x0 = w, y0 = h, x1 = -1, y1 = -1;
-    for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
-        if (item.mask[static_cast<size_t>(y) * w + x]) { x0 = std::min(x0, x); y0 = std::min(y0, y); x1 = std::max(x1, x); y1 = std::max(y1, y); }
-    if (x1 >= 0 && (x0 > 0 || y0 > 0 || x1 < w - 1 || y1 < h - 1)) {
-        const int nw = x1 - x0 + 1, nh = y1 - y0 + 1;
-        std::vector<uint8_t> cropped(static_cast<size_t>(nw) * nh);
-        for (int y = 0; y < nh; ++y)
-            std::copy_n(&item.mask[static_cast<size_t>(y + y0) * w + x0], nw, &cropped[static_cast<size_t>(y) * nw]);
-        item.mask = std::move(cropped);
-        item.left += x0; item.top += y0; item.width = nw; item.height = nh;
-        item.box = {static_cast<float>(item.left), static_cast<float>(item.top),
-                    static_cast<float>(item.left + nw), static_cast<float>(item.top + nh)};
-    }
+    for (size_t i = 0; i < n; ++i)
+        if (item.mask[i] && drop[label[i]]) { item.mask[i] = 0; if (!item.support.empty()) item.support[i] = 0; }
+    trim(item);
     return {holes, islands};
+}
+
+void trim(Instance& item) {
+    const int w = item.width, h = item.height;
+    int x0 = w, y0 = h, x1 = -1, y1 = -1;
+    for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+        const size_t i = static_cast<size_t>(y) * w + x;
+        if (item.mask[i] || (!item.support.empty() && item.support[i])) {
+            x0 = std::min(x0, x); y0 = std::min(y0, y); x1 = std::max(x1, x); y1 = std::max(y1, y);
+        }
+    }
+    if (x1 >= 0 && (x0 > 0 || y0 > 0 || x1 < w - 1 || y1 < h - 1)) recrop(item, x0, y0, x1 + 1, y1 + 1);
+}
+
+void clearExcluded(Instance& item, const uint8_t* negative, int documentWidth, size_t& cleared) {
+    for (int y = 0; y < item.height; ++y)
+        for (int x = 0; x < item.width; ++x) {
+            const size_t i = static_cast<size_t>(y) * item.width + x;
+            if (!negative[static_cast<size_t>(y + item.top) * documentWidth + x + item.left]) continue;
+            if (!item.support.empty()) item.support[i] = 0;
+            if (item.mask[i]) { item.mask[i] = 0; ++cleared; }
+        }
 }
 
 void finishInstances(std::vector<Instance>& result, const SegmentOptions& options, Json& diagnostics) {
@@ -214,11 +230,35 @@ std::string deviceName(const Json& adapters, int device) {
 Engine::Engine() = default;
 Engine::~Engine() = default;
 
-Json Engine::initialize(const std::filesystem::path& directory, int device, bool allowUnvalidated) {
+Json Engine::initialize(const std::filesystem::path& directory, int device, bool allowUnvalidated, const LoadOptions& load) {
     std::ifstream file(directory / "model.json");
     if (!file) throw Error("MODEL_MISSING", "Missing model.json");
     Json manifest;
     file >> manifest;
+    // Input sizes this bundle offers: its native size plus validated variants.
+    Json sizes = Json::array({manifest.value("inputSize", 0)});
+    if (manifest.contains("variants"))
+        for (const auto& [key, variant] : manifest.at("variants").items())
+            if (allowUnvalidated || variant.value("validation", Json::object()).value("passed", false))
+                sizes.push_back(variant.value("inputSize", 0));
+    if (load.inputSize && load.inputSize != manifest.value("inputSize", 0)) {
+        const auto key = std::to_string(load.inputSize);
+        if (!manifest.contains("variants") || !manifest.at("variants").contains(key))
+            throw Error("MODEL_VERSION", "This bundle has no " + key + " px variant");
+        const Json& variant = manifest.at("variants").at(key);
+        if (!allowUnvalidated && !variant.value("validation", Json::object()).value("passed", false))
+            throw Error("MODEL_UNVALIDATED", "The " + key + " px variant has not passed validation");
+        // A variant replaces the size-dependent fields; weights, hashes and settings stay the bundle's.
+        for (const char* field : {"inputSize", "maskSize", "refineMaskSize", "graphs", "validation"})
+            if (variant.contains(field)) manifest[field] = variant.at(field);
+    }
+    const std::string bundleOptimization = manifest.value("dmlOptimization", std::string("all"));
+    if (!load.optimization.empty()) {
+        static const std::array<const char*, 4> levels{"disable", "basic", "extended", "all"};
+        if (std::find(levels.begin(), levels.end(), load.optimization) == levels.end())
+            throw Error("INVALID_OPTIONS", "Unknown graph optimization level: " + load.optimization);
+        manifest["dmlOptimization"] = load.optimization;
+    }
     if (manifest.value("runtime", "") != "onnxruntime") throw Error("MODEL_VERSION", "Bundle is not an ONNX Runtime export");
     if (!allowUnvalidated && !manifest.at("validation").value("passed", false))
         throw Error("MODEL_UNVALIDATED", "Model parity gate has not passed; run the bundle's validation tool");
@@ -251,18 +291,36 @@ Json Engine::initialize(const std::filesystem::path& directory, int device, bool
     model_ = std::move(model);
     device_ = device;
     gpuOnly_ = gpuOnly;
+    lowVram_ = load.lowVram;
     info_ = model_->describeModel();
     info_.update({{"device", device}, {"deviceName", deviceName(devices, device)}, {"devices", devices},
                   {"backend", device >= 0 ? "DirectML" : "CPU"}, {"precision", manifest.value("precision", "fp32")},
-                  {"requiresGpu", gpuOnly},
+                  {"requiresGpu", gpuOnly}, {"lowVram", lowVram_}, {"inputSizes", sizes},
+                  {"optimization", manifest.value("dmlOptimization", std::string("all"))},
+                  {"bundleOptimization", bundleOptimization},
                   {"validationPassed", manifest.at("validation").value("passed", false)},
                   {"runtimeVersion", runtimeVersion()}});
     if (!fallbackReason.empty()) info_["fallbackReason"] = fallbackReason;
     return info_;
 }
 
-void Engine::fallBackToCpu(const std::string& reason) {
-    if (gpuOnly_) throw Error("GPU_REQUIRED", "GPU inference failed and this model does not run on the CPU: " + reason);
+void Engine::unload() {
+    model_.reset();
+    raw_.clear(); raw_.shrink_to_fit();
+    rawAdd_.clear(); rawAdd_.shrink_to_fit();
+    rawExclude_.clear(); rawExclude_.shrink_to_fit();
+    rawSession_ = 0;
+    ++resultId_;  // invalidates any resmooth() of the old result
+    promptDiagnostics_ = Json::object();
+}
+
+void Engine::fallBackToCpu(const Error& failure) {
+    const std::string reason = failure.what();
+    if (gpuOnly_) {
+        // Keep out-of-memory / device-lost codes so the panel can suggest a lighter model.
+        if (gpuFailure(failure.code)) throw Error(failure.code, reason);
+        throw Error("GPU_REQUIRED", "GPU inference failed and this model does not run on the CPU: " + reason);
+    }
     model_->open(-1);
     device_ = -1;
     info_["device"] = -1; info_["deviceName"] = "CPU"; info_["backend"] = "CPU"; info_["fallbackReason"] = reason;
@@ -284,12 +342,16 @@ std::shared_ptr<Session> Engine::prepareImage(const uint8_t* rgba, size_t length
     auto input = model_->preprocess(rgba, length, width, height, session->geometry);
     checkCancel(cancel);
     try { session->features = model_->encode(input); } catch (const Error& error) {
+        // A failed pass can leave the encoder's GPU arena allocated; return it first.
+        if (gpuFailure(error.code)) model_->releaseEncoder();
         if (device_ < 0 || error.code == "CANCELLED") throw;
-        fallBackToCpu(error.what());
+        fallBackToCpu(error);
         session->features = model_->encode(input);
     }
+    // Low-VRAM mode: drop the encoder's GPU arena now; the next image (or detail pass) reopens it.
+    if (lowVram_) model_->releaseEncoder();
     checkCancel(cancel);
-    if (model_->retainsImage()) session->image.assign(rgba, rgba + length);
+    session->image.assign(rgba, rgba + length);
     session->id = nextSession_++;
     return session;
 }
@@ -309,8 +371,8 @@ std::vector<Instance> Engine::segment(const Session& session, const uint8_t* alp
     std::vector<Instance> result;
     try { result = model_->segment(session, alpha, negative, plane, options, promptDiagnostics_, cancel); }
     catch (const Error& error) {
-        if (device_ < 0 || error.code != "INFERENCE_FAILED") throw;
-        fallBackToCpu(error.what());
+        if (device_ < 0 || (error.code != "INFERENCE_FAILED" && !gpuFailure(error.code))) throw;
+        fallBackToCpu(error);
         result = model_->segment(session, alpha, negative, plane, options, promptDiagnostics_, cancel);
     }
     finishInstances(result, options, promptDiagnostics_);
@@ -319,30 +381,25 @@ std::vector<Instance> Engine::segment(const Session& session, const uint8_t* alp
     if (options.currentOnly && !result.empty()) {
         try { promptDiagnostics_["refined"] = model_->refine(session, result.front(), alpha, negative, promptDiagnostics_, cancel); }
         catch (const Error& error) {
-            if (error.code == "CANCELLED") throw;
+            if (error.code == "CANCELLED" || error.code == "GPU_LOST") throw;
             promptDiagnostics_["refineError"] = error.what();  // keep the detector result
+            if (error.code == "GPU_MEMORY") promptDiagnostics_["refineOutOfMemory"] = true;
         }
         if (options.detail) {
             try { promptDiagnostics_["detailed"] = model_->detail(session, result.front(), alpha, negative, promptDiagnostics_, cancel); }
             catch (const Error& error) {
-                if (error.code == "CANCELLED") throw;
+                if (lowVram_ || gpuFailure(error.code)) model_->releaseEncoder();
+                if (error.code == "CANCELLED" || error.code == "GPU_LOST") throw;
                 promptDiagnostics_["detailError"] = error.what();  // keep the full-image result
+                if (error.code == "GPU_MEMORY") promptDiagnostics_["detailOutOfMemory"] = true;
             }
+            if (lowVram_) model_->releaseEncoder();  // the detail pass re-encodes a crop
         }
     }
-    // Exclude strokes always win: clear any mask pixel painted with the exclude brush.
-    if (negative) {
-        size_t cleared = 0;
-        for (auto& item : result)
-            for (int y = 0; y < item.height; ++y)
-                for (int x = 0; x < item.width; ++x) {
-                    uint8_t& value = item.mask[static_cast<size_t>(y) * item.width + x];
-                    if (value && negative[static_cast<size_t>(y + item.top) * session.geometry.width + x + item.left]) {
-                        value = 0; ++cleared;
-                    }
-                }
-        promptDiagnostics_["excludedPixelsCleared"] = cleared;
-    }
+    // Exclude strokes always win: clear any mask pixel painted with the exclude brush, before
+    // cleanup (so excluded regions are not refilled as holes) and again after smoothing.
+    size_t cleared = 0;
+    if (negative) for (auto& item : result) clearExcluded(item, negative, session.geometry.width, cleared);
     // Remove pinholes and stray specks left by upsampling 288×288 logits and by merging parts.
     if (const double area = model_->cleanupArea(session.geometry); area >= 1) {
         size_t holes = 0, islands = 0;
@@ -350,12 +407,58 @@ std::vector<Instance> Engine::segment(const Session& session, const uint8_t* alp
             auto [h, i] = cleanMask(item, static_cast<size_t>(std::max(1.0, area * item.cleanupScale)));
             holes += h; islands += i;
         }
-        result.erase(std::remove_if(result.begin(), result.end(), [](const auto& x) { return x.mask.empty() ||
-            std::none_of(x.mask.begin(), x.mask.end(), [](uint8_t v) { return v != 0; }); }), result.end());
         promptDiagnostics_["cleanupArea"] = area;
         promptDiagnostics_["holesFilled"] = holes;
         promptDiagnostics_["islandsRemoved"] = islands;
     }
+    if (negative) promptDiagnostics_["excludedPixelsCleared"] = cleared;
+    checkCancel(cancel);
+    // Keep the unsmoothed result so the panel's smoothing sliders can redo only the finish.
+    raw_ = std::move(result);
+    rawAdd_.assign(alpha, alpha + plane);
+    if (negative) rawExclude_.assign(negative, negative + plane); else rawExclude_.clear();
+    rawSession_ = session.id;
+    ++resultId_;
+    return finish(session, options.smoothing, cancel);
+}
+
+std::vector<Instance> Engine::resmooth(const Session& session, uint64_t resultId, const SmoothParams& params,
+                                       const std::atomic_bool* cancel) {
+    if (!model_) throw Error("NOT_INITIALIZED", "Initialize the model first");
+    if (resultId != resultId_ || rawSession_ != session.id) throw Error("STALE_RESULT", "Recognize again before adjusting the edges");
+    return finish(session, params, cancel);
+}
+
+// Close gaps, drop stray fragments and soften the edges along the image, on a copy of raw_.
+std::vector<Instance> Engine::finish(const Session& session, const SmoothParams& params, const std::atomic_bool* cancel) {
+    std::vector<Instance> result = raw_;
+    const uint8_t* negative = rawExclude_.empty() ? nullptr : rawExclude_.data();
+    const double cell = model_->maskCell(session.geometry);
+    promptDiagnostics_["smoothing"] = {{"smooth", params.smooth}, {"expand", params.expand}};
+    size_t maskPixels = 0, supportPixels = 0;
+    for (const auto& item : result)
+        for (size_t i = 0; i < item.mask.size(); ++i) { maskPixels += item.mask[i] > 0; supportPixels += supportAt(item, i); }
+    promptDiagnostics_["rawMaskPixels"] = maskPixels;
+    promptDiagnostics_["rawSupportPixels"] = supportPixels;
+    promptDiagnostics_["maskCell"] = cell;
+    if (cell > 0 && !session.image.empty()) {
+        SmoothStats stats;
+        for (auto& item : result) {
+            smoothMask(item, session, rawAdd_.data(), cell * std::sqrt(item.cleanupScale), params, stats);
+            checkCancel(cancel);
+        }
+        promptDiagnostics_["fragmentsRemoved"] = stats.fragments;
+        promptDiagnostics_["gapPixelsClosed"] = stats.closed;
+        promptDiagnostics_["gapPixelsFromSupport"] = stats.supported;
+        promptDiagnostics_["closeRadius"] = stats.closeRadius;
+        promptDiagnostics_["edgeRadius"] = stats.edgeRadius;
+        // Exclude strokes win over gap filling too.
+        size_t cleared = 0;
+        if (negative) for (auto& item : result) clearExcluded(item, negative, session.geometry.width, cleared);
+    }
+    for (auto& item : result) item.support.clear();
+    result.erase(std::remove_if(result.begin(), result.end(), [](const auto& x) { return x.mask.empty() ||
+        std::none_of(x.mask.begin(), x.mask.end(), [](uint8_t v) { return v != 0; }); }), result.end());
     checkCancel(cancel);
     return result;
 }

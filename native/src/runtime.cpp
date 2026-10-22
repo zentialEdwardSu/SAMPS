@@ -8,6 +8,7 @@
 #include "internal.h"
 #include <dml_provider_factory.h>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <mutex>
 #include <thread>
@@ -108,6 +109,24 @@ Json adapters() {
     return result;
 }
 
+const char* failureCode(const std::string& message, const char* fallback) {
+    std::string text(message.size(), '\0');
+    std::transform(message.begin(), message.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const auto has = [&](const char* needle) { return text.find(needle) != std::string::npos; };
+    // DXGI_ERROR_DEVICE_REMOVED / HUNG / RESET / DRIVER_INTERNAL_ERROR: the D3D device is gone (often a
+    // TDR after exhausting memory); every later call on it fails until the sessions are recreated.
+    if (has("887a0005") || has("887a0006") || has("887a0007") || has("887a0020") || has("device_removed") ||
+        has("device removed"))
+        return "GPU_LOST";
+    // E_OUTOFMEMORY (also localized as 内存资源不足), and ORT/DML allocation failures.
+    if (has("8007000e") || has("e_outofmemory") || has("out of memory") || has("outofmemory") ||
+        has("not enough memory") || has("failed to allocate") || has("bad allocation") || has("bad_alloc") ||
+        has("\xe5\x86\x85\xe5\xad\x98\xe4\xb8\x8d\xe8\xb6\xb3") /* 内存不足 */ ||
+        has("\xe5\x86\x85\xe5\xad\x98\xe8\xb5\x84\xe6\xba\x90\xe4\xb8\x8d\xe8\xb6\xb3") /* 内存资源不足 */)
+        return "GPU_MEMORY";
+    return fallback;
+}
+
 std::unique_ptr<Ort::Session> openSession(const std::filesystem::path& path, int device, const Json& options) {
     environment();
     try {
@@ -118,16 +137,19 @@ std::unique_ptr<Ort::Session> openSession(const std::filesystem::path& path, int
             // DirectML requires sequential execution without memory patterns.
             settings.DisableMemPattern();
             settings.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-            // Some graphs (the SAM 3 ViT) crash ORT's DirectML graph transforms at session creation.
-            if (options.value("dmlOptimization", std::string("all")) == "disable")
-                settings.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_DISABLE_ALL);
+            // Some graphs (the SAM 3 ViT) crash ORT's DirectML graph transforms at session creation;
+            // the bundle picks a level ("disable", "basic", "extended", "all"), the panel may override it.
+            const auto level = options.value("dmlOptimization", std::string("all"));
+            if (level == "disable") settings.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_DISABLE_ALL);
+            else if (level == "basic") settings.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
+            else if (level == "extended") settings.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
             const OrtDmlApi* dml = nullptr;
             Ort::ThrowOnError(Ort::GetApi().GetExecutionProviderApi("DML", ORT_API_VERSION, reinterpret_cast<const void**>(&dml)));
             Ort::ThrowOnError(dml->SessionOptionsAppendExecutionProvider_DML(settings, device));
         }
         return std::make_unique<Ort::Session>(environment(), path.c_str(), settings);
     } catch (const Ort::Exception& error) {
-        throw Error("MODEL_LOAD", path.filename().u8string() + ": " + error.what());
+        throw Error(failureCode(error.what(), "MODEL_LOAD"), path.filename().u8string() + ": " + error.what());
     }
 }
 
@@ -151,7 +173,7 @@ std::vector<Tensor> run(Ort::Session& session, const std::vector<const char*>& i
     } catch (const Ort::Exception& error) {
         stop();
         checkCancel(cancelled);
-        throw Error("INFERENCE_FAILED", error.what());
+        throw Error(failureCode(error.what(), "INFERENCE_FAILED"), error.what());
     }
     stop();
     checkCancel(cancelled);

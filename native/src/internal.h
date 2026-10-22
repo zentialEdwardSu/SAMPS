@@ -15,6 +15,10 @@ Ort::Env& environment();
 std::string runtimeVersion();
 Json adapters();
 std::unique_ptr<Ort::Session> openSession(const std::filesystem::path& path, int device, const Json& manifest);
+// Error code for an ONNX Runtime / DirectML failure message: "GPU_MEMORY" (allocation failed),
+// "GPU_LOST" (the D3D device was removed or reset), otherwise `fallback`.
+const char* failureCode(const std::string& message, const char* fallback);
+inline bool gpuFailure(const std::string& code) { return code == "GPU_MEMORY" || code == "GPU_LOST"; }
 const OrtMemoryInfo* cpuMemory();
 template <class T> Ort::Value tensor(T* data, size_t count, std::initializer_list<int64_t> shape) {
     const std::vector<int64_t> dims(shape);
@@ -47,6 +51,9 @@ class Model {
 public:
     virtual ~Model() = default;
     virtual void open(int device) = 0;
+    // Destroys the image encoder session, returning its GPU arena (most of the model's VRAM);
+    // the next encode reopens it. Used by the low-VRAM mode.
+    virtual void releaseEncoder() {}
     virtual std::vector<float> preprocess(const uint8_t* rgba, size_t length, int width, int height, Geometry&) const = 0;
     virtual std::vector<Tensor> encode(std::vector<float>& input) = 0;
     // alpha: "add" strokes; negative: "exclude" strokes or null. Both are document-sized planes of `length` bytes.
@@ -56,8 +63,8 @@ public:
     // Holes and islands smaller than this many document pixels are removed from every result
     // (SAM 3's fill_hole_area, in model mask cells, scaled to the document). 0 disables cleanup.
     virtual double cleanupArea(const Geometry&) const { return 0; }
-    // Whether prepareImage should keep the document RGBA in the session (needed by detail()).
-    virtual bool retainsImage() const { return false; }
+    // Side of one model mask cell in document pixels; 0 disables smoothMask.
+    virtual double maskCell(const Geometry&) const { return 0; }
     // Re-predicts the current object's edges from a crop encoded at full model resolution.
     // Returns false (leaving `current` unchanged) when unsupported or not worthwhile.
     virtual bool detail(const Session&, Instance& current, const uint8_t* add, const uint8_t* exclude,
@@ -83,7 +90,24 @@ Instance mergeInstances(std::vector<Instance>& parts);
 // Fills enclosed holes and removes islands smaller than `area` pixels (the largest island is
 // always kept), then re-crops the mask. Returns {holes filled, islands removed}.
 std::pair<size_t, size_t> cleanMask(Instance&, size_t area);
+// Shrinks the crop to the pixels set in mask or support.
+void trim(Instance&);
+// Clears mask and support pixels painted in the document-sized exclude plane; counts cleared mask pixels.
+void clearExcluded(Instance&, const uint8_t* negative, int documentWidth, size_t& cleared);
 // Fraction of add-stroke pixels an instance must cover to be merged into the current object.
 constexpr float MergeOverlap = .05f;
+
+// postprocess.cpp
+// Mask logits above this (sigmoid ≈ 12%) are weak evidence: never output on their own, but gap
+// closing may add them (see Instance::support).
+constexpr float SupportLogit = -2.f;
+inline bool supportAt(const Instance& item, size_t i) { return item.support.empty() ? item.mask[i] > 0 : item.support[i] > 0; }
+// Crops mask and support to [x0, x1) × [y0, y1) of the current crop (may extend past it; new pixels are 0).
+void recrop(Instance&, int x0, int y0, int x1, int y1);
+struct SmoothStats { size_t fragments = 0, closed = 0, supported = 0; double closeRadius = 0, edgeRadius = 0; };
+// Removes stray fragments untouched by add strokes, closes gaps (small ones always, larger ones
+// only where the model has weak support), smooths the contour and softens edges with a guided
+// filter on the document image. `cell` is maskCell(); `add` is the document-sized add plane.
+void smoothMask(Instance&, const Session&, const uint8_t* add, double cell, const SmoothParams&, SmoothStats&);
 std::filesystem::path graphPath(const std::filesystem::path& directory, const Json& manifest, const char* graph);
 }

@@ -1,12 +1,12 @@
 import { SampsError } from "../core/errors";
-import { assertDocument, assertFresh, isExclude, isMarks, isPreview, isPrompt, managed, stamp, walkLayers, EXCLUDE_PREFIX,
-  MARKS_PREFIX, PREVIEW_PREFIX, PROMPT_PREFIX, RESULT_PREFIX, type MarkKind, type Stamp } from "../core/document";
+import { assertDocument, assertFresh, isExclude, isMarks, isPreview, isPrompt, managed, stamp, walkLayers, workSize, EXCLUDE_PREFIX,
+  MARKS_PREFIX, PREVIEW_PREFIX, PROMPT_PREFIX, RESULT_PREFIX, type MarkKind, type Stamp, type WorkSize } from "../core/document";
 
 export type MarkTool = "brush" | "eraser";
 // Tools that paint into the target layer's pixels; Photoshop refuses them on hidden layers.
 const PAINT_TOOLS = new Set(["paintbrushTool", "pencilTool", "mixerBrushTool", "eraserTool", "backgroundEraserTool"]);
 const MARKS_NAME = `${MARKS_PREFIX} 添加 / 排除`;
-import { expandGray, expandPixels, mergeMasks, type MaskInstance } from "../core/pixels";
+import { documentMask, expandGray, expandPixels, GrayMaxDownsampler, RgbaDownsampler, type MaskInstance } from "../core/pixels";
 import { combineSelection, isEmpty, type SelectionMode } from "../core/selection";
 import { labPixelsToRgba } from "../core/color";
 
@@ -14,6 +14,10 @@ type PS = any;
 type Doc = any;
 type Layer = any;
 
+/**
+ * `width` / `height` are the working size the model sees (the document size up to WORK_PIXELS,
+ * smaller beyond); masks come back at this size and are scaled to the document for output.
+ */
 export interface Capture {
   rgba: Uint8Array; alpha: Uint8Array; exclude: Uint8Array | null; width: number; height: number; promptId: number;
   promptRead: Record<string, unknown>; captureMethod: string; stamp: Stamp;
@@ -59,6 +63,38 @@ export class PhotoshopHost {
     }, { commandName: name });
   }
 
+  /**
+   * Runs `action`, then puts back the visibility of every user (non-plugin) layer. Showing a
+   * plugin layer must never reveal the user's own layers, which Photoshop can do when it applies
+   * a visibility change to the selected layers rather than only the target.
+   */
+  private async keepUserVisibility<T>(doc: Doc, action: () => Promise<T>): Promise<T> {
+    const user = walkLayers<Layer>(doc.layers).filter(layer => !managed(layer)).map(layer => ({ layer, visible: layer.visible }));
+    try { return await action(); }
+    finally {
+      for (const { layer, visible } of user) {
+        try { if (layer.visible !== visible) layer.visible = visible; } catch { /* layer deleted by the action */ }
+      }
+    }
+  }
+
+  /**
+   * Sets the active tool's opacity, keeping its other options. Marks are read as "painted where
+   * alpha > 0", so a 50% brush keeps the image visible without changing the prompt.
+   */
+  private async setToolOpacity(tool: string, percent: number) {
+    const [result] = await this.batchPlay([{ _obj: "get", _target: [{ _property: "currentToolOptions" },
+      { _ref: "application", _enum: "ordinal", _value: "targetEnum" }], _options: silent }]);
+    const options = result?.currentToolOptions;
+    if (!options || options.opacity === undefined) return;
+    const current = options.opacity;
+    const opacity = typeof current === "object" ? { ...current, _value: percent } : percent;
+    if ((typeof current === "object" ? current._value : current) === percent) return;
+    // Write the full options back: a partial descriptor can reset the brush preset.
+    await this.batchPlay([{ _obj: "set", _target: [{ _ref: tool }],
+      to: { ...options, _obj: "currentToolOptions", opacity }, _options: silent }]);
+  }
+
   promptLayers(doc: Doc, kind: MarkKind = "add"): Layer[] {
     return walkLayers<Layer>(doc.layers).filter(kind === "add" ? isPrompt : isExclude);
   }
@@ -89,7 +125,7 @@ export class PhotoshopHost {
    */
   async beginMarking(kind: MarkKind = "add", tool: MarkTool = "brush") {
     const doc = this.document; assertDocument(doc);
-    return this.history(doc, kind === "add" ? "SAMPS 标记添加" : "SAMPS 标记排除", async () => {
+    return this.history(doc, kind === "add" ? "SAMPS 标记添加" : "SAMPS 标记排除", () => this.keepUserVisibility(doc, async () => {
       const group = await this.ensureMarksGroup(doc);
       group.visible = true;
       let layer = this.activePrompt(doc, kind);
@@ -101,8 +137,11 @@ export class PhotoshopHost {
       doc.activeLayers = [layer];
       doc.activeChannels = doc.componentChannels;
       await this.deselect(doc);
-      await this.batchPlay([{ _obj: "select", _target: [{ _ref: tool === "brush" ? "paintbrushTool" : "eraserTool" }],
-        _options: silent }]);
+      const toolRef = tool === "brush" ? "paintbrushTool" : "eraserTool";
+      await this.batchPlay([{ _obj: "select", _target: [{ _ref: toolRef }], _options: silent }]);
+      // A 50% brush keeps the image readable under the marks; the eraser must erase fully, or
+      // faint leftovers would still count as painted.
+      try { await this.setToolOpacity(toolRef, tool === "brush" ? 50 : 100); } catch { /* opacity is only a convenience */ }
       if (tool === "brush") {
         const [red, grain, blue] = MARK_COLORS[kind];
         try {
@@ -111,7 +150,7 @@ export class PhotoshopHost {
         } catch { /* the colour is only a visual cue */ }
       }
       return layer.id;
-    });
+    }));
   }
 
   /**
@@ -131,10 +170,10 @@ export class PhotoshopHost {
     if (!target) return false;
     const group = this.marksGroup(doc);
     if (target.visible && (!group || group.visible)) return false;
-    await this.history(doc, "SAMPS 显示标记", async () => {
+    await this.history(doc, "SAMPS 显示标记", () => this.keepUserVisibility(doc, async () => {
       if (group) group.visible = true;
       target.visible = true;
-    });
+    }));
     return true;
   }
 
@@ -153,9 +192,12 @@ export class PhotoshopHost {
     const layers = walkLayers<Layer>(doc.layers).filter(target === "marks" ? isMarks : isPreview);
     if (!layers.length) return null;
     const label = target === "marks" ? "标记" : "预览";
-    await this.history(doc, `SAMPS ${visible ? "显示" : "隐藏"}${label}`, async () => {
+    await this.history(doc, `SAMPS ${visible ? "显示" : "隐藏"}${label}`, () => this.keepUserVisibility(doc, async () => {
       for (const layer of layers) layer.visible = visible;
-    });
+      // Showing the group must also show its marking layers, or the eye button looks broken.
+      if (visible && target === "marks")
+        for (const layer of [...this.promptLayers(doc, "add"), ...this.promptLayers(doc, "exclude")]) layer.visible = true;
+    }));
     return this.stamp();
   }
 
@@ -237,11 +279,61 @@ export class PhotoshopHost {
    * the layer thumbnail). The selection is a document-level gray plane, so this works for
    * any color mode, bit depth or smart-object content without rendering the layer.
    */
-  async readPromptAlpha(doc: Doc, prompt: Layer): Promise<Uint8Array> {
+  async readPromptAlpha(doc: Doc, prompt: Layer, work: WorkSize = { width: doc.width, height: doc.height }): Promise<Uint8Array> {
     await this.batchPlay([{ _obj: "set", _target: [{ _ref: "channel", _property: "selection" }],
       to: { _ref: [{ _ref: "channel", _enum: "channel", _value: "transparencyEnum" }, { _ref: "layer", _id: prompt.id }] },
       _options: silent }]);
-    return (await this.readSelection(doc)) || new Uint8Array(doc.width * doc.height);
+    return this.readSelectionAt(doc, work);
+  }
+
+  /**
+   * The selection at working size. Large documents are read in strips and reduced by maximum,
+   * so a full-resolution plane is never held and thin strokes are kept.
+   */
+  async readSelectionAt(doc: Doc, work: WorkSize): Promise<Uint8Array> {
+    if (work.width === doc.width && work.height === doc.height)
+      return (await this.readSelection(doc)) || new Uint8Array(doc.width * doc.height);
+    if (!(await this.hasSelection(doc))) return new Uint8Array(work.width * work.height);
+    const sampler = new GrayMaxDownsampler(doc.width, doc.height, work.width, work.height);
+    // Photoshop rejects a selection read whose region holds no selected pixels ("Invalid Source
+    // Bounds"), so only strips inside the selection's bounds are read.
+    const area = (await this.selectionBounds(doc)) || { left: 0, top: 0, right: doc.width, bottom: doc.height };
+    const rows = Math.max(1, Math.min(doc.height, Math.floor(STRIP_BYTES / doc.width)));
+    for (let top = area.top; top < area.bottom; top += rows) {
+      const bottom = Math.min(area.bottom, top + rows);
+      let result;
+      try {
+        result = await this.ps.imaging.getSelection({ documentID: doc.id,
+          sourceBounds: { left: area.left, top, right: area.right, bottom } });
+      } catch (error) {
+        if (/source bounds/i.test(String((error as Error)?.message || error))) continue;  // empty strip
+        throw error;
+      }
+      try {
+        const data = await result.imageData.getData({ chunky: true });
+        const bounds = { left: result.sourceBounds.left, top: result.sourceBounds.top - top };
+        sampler.push(expandGray(data, result.imageData, bounds, doc.width, bottom - top), top, bottom - top);
+      } finally { result.imageData.dispose(); }
+    }
+    return sampler.output;
+  }
+
+  /** Integer bounds of the current selection clamped to the canvas, or null when unknown or empty. */
+  async selectionBounds(doc: Doc): Promise<{ left: number; top: number; right: number; bottom: number } | null> {
+    const value = (v: any) => Number(typeof v === "object" && v !== null ? v._value : v);
+    let raw: any = doc.selection?.bounds;
+    if (raw === undefined) {
+      try {
+        const [result] = await this.batchPlay([{ _obj: "get", _target: [{ _property: "selection" }, { _ref: "document", _id: doc.id }],
+          _options: silent }]);
+        raw = result?.selection;
+      } catch { return null; }
+    }
+    if (!raw) return null;
+    const left = Math.max(0, Math.floor(value(raw.left))), top = Math.max(0, Math.floor(value(raw.top)));
+    const right = Math.min(doc.width, Math.ceil(value(raw.right))), bottom = Math.min(doc.height, Math.ceil(value(raw.bottom)));
+    if (![left, top, right, bottom].every(Number.isFinite) || right <= left || bottom <= top) return null;
+    return { left, top, right, bottom };
   }
 
   /**
@@ -249,29 +341,33 @@ export class PhotoshopHost {
    * the mode/profile conversion; 16-bit documents are read at 16 bits and dithered here.
    * Falls back to native Lab samples converted in JS if the host rejects an RGB conversion.
    */
-  async readComposite(doc: Doc, record: Record<string, unknown>): Promise<Uint8Array> {
+  async readComposite(doc: Doc, record: Record<string, unknown>,
+    work: WorkSize = { width: doc.width, height: doc.height }): Promise<Uint8Array> {
     const size = doc.bitsPerChannel === "bitDepth16" ? 16 : 8;
     try {
-      const rgba = await this.readStrips(doc, { colorSpace: "RGB", colorProfile: SRGB, componentSize: size }, null);
+      const rgba = await this.readStrips(doc, { colorSpace: "RGB", colorProfile: SRGB, componentSize: size }, null, work);
       record.compositeRead = size === 16 ? "photoshop-rgb16-dither" : "photoshop-rgb8";
       return rgba;
     } catch (error) {
       if (doc.mode !== "labColorMode") throw error;
       record.rgbReadError = String((error as Error).message || error);
       const rgba = await this.readStrips(doc, { componentSize: size },
-        (data, info) => labPixelsToRgba(data, info.components, size as 8 | 16));
+        (data, info) => labPixelsToRgba(data, info.components, size as 8 | 16), work);
       record.compositeRead = "lab-native-js-convert";
       return rgba;
     }
   }
 
   /**
-   * Reads the composite in horizontal strips into a full-canvas 8-bit RGBA buffer.
-   * `convert` turns non-RGB samples into 8-bit RGBA; when null, samples are RGB(A).
+   * Reads the composite in horizontal strips into an 8-bit RGBA buffer at working size
+   * (box-averaged when smaller than the document). `convert` turns non-RGB samples into
+   * 8-bit RGBA; when null, samples are RGB(A).
    */
   private async readStrips(doc: Doc, format: object,
-    convert: ((data: any, info: any) => Uint8Array) | null): Promise<Uint8Array> {
-    const out = new Uint8Array(doc.width * doc.height * 4);
+    convert: ((data: any, info: any) => Uint8Array) | null, work: WorkSize): Promise<Uint8Array> {
+    const scaled = work.width !== doc.width || work.height !== doc.height;
+    const sampler = scaled ? new RgbaDownsampler(doc.width, doc.height, work.width, work.height) : null;
+    const out = sampler ? sampler.output : new Uint8Array(doc.width * doc.height * 4);
     const rows = Math.max(1, Math.min(doc.height, Math.floor(STRIP_BYTES / (doc.width * 8))));
     for (let top = 0; top < doc.height; top += rows) {
       const bottom = Math.min(doc.height, top + rows);
@@ -284,10 +380,12 @@ export class PhotoshopHost {
         if (convert) { data = convert(data, info); info = { width: info.width, height: info.height, components: 4, componentSize: 8 }; }
         // Imaging trims fully transparent margins; position the returned block inside this strip.
         const bounds = { left: pixels.sourceBounds.left, top: pixels.sourceBounds.top - top };
-        out.set(expandPixels(data, info, bounds, doc.width, bottom - top), top * doc.width * 4);
+        const strip = expandPixels(data, info, bounds, doc.width, bottom - top);
+        if (sampler) sampler.push(strip, top, bottom - top);
+        else out.set(strip, top * doc.width * 4);
       } finally { pixels.imageData.dispose(); }
     }
-    return out;
+    return sampler ? sampler.finish() : out;
   }
 
   async capture(): Promise<Capture> {
@@ -300,8 +398,10 @@ export class PhotoshopHost {
       const prompt = this.activePrompt(doc);
       if (!prompt) throw new SampsError("NO_PROMPT_LAYER", "请先点击“开始标记”，再在提示图层上涂抹。");
       const visibility = layers.filter(managed).map(layer => ({ layer, visible: layer.visible }));
+      const work = workSize(doc.width, doc.height);
       const record: Record<string, unknown> = { layerId: prompt.id, layerName: prompt.name, mode: doc.mode,
-        depth: doc.bitsPerChannel, profile: doc.colorProfileName, readMethod: "transparency-selection" };
+        depth: doc.bitsPerChannel, profile: doc.colorProfileName, readMethod: "transparency-selection",
+        documentSize: [doc.width, doc.height], workSize: [work.width, work.height] };
       const suspension = await context.hostControl.suspendHistory({ documentID: doc.id, name: "SAMPS 读取画面" });
       let failure: unknown = null, result: Omit<Capture, "stamp"> | undefined, stage = "备份当前选区";
       let saved: Uint8Array | null = null, selectionTouched = false;
@@ -309,12 +409,12 @@ export class PhotoshopHost {
         saved = await this.readSelection(doc);
         stage = "读取提示图层透明度";
         selectionTouched = true;
-        const alpha = await this.readPromptAlpha(doc, prompt);
+        const alpha = await this.readPromptAlpha(doc, prompt, work);
         let exclude: Uint8Array | null = null;
         const excludeLayer = this.activePrompt(doc, "exclude");
         if (excludeLayer && excludeLayer.visible) {
           stage = "读取排除图层透明度";
-          exclude = await this.readPromptAlpha(doc, excludeLayer);
+          exclude = await this.readPromptAlpha(doc, excludeLayer, work);
           if (!exclude.some(value => value > 0)) exclude = null;
           record.excludeLayerId = excludeLayer.id;
         }
@@ -324,9 +424,9 @@ export class PhotoshopHost {
         stage = "临时隐藏插件图层";
         for (const { layer, visible } of visibility) if (visible) layer.visible = false;
         stage = "读取原图合成像素";
-        const rgba = await this.readComposite(doc, record);
+        const rgba = await this.readComposite(doc, record, work);
         if (context.isCancelled) throw new SampsError("CANCELLED", "操作已取消。");
-        result = { rgba, alpha, exclude, width: doc.width, height: doc.height, promptId: prompt.id, promptRead: record,
+        result = { rgba, alpha, exclude, width: work.width, height: work.height, promptId: prompt.id, promptRead: record,
           captureMethod: String(record.compositeRead) };
       } catch (error) {
         failure = error instanceof SampsError ? error : new SampsError("CAPTURE_FAILED", `${stage}失败：${(error as Error).message || error}`);
@@ -381,14 +481,14 @@ export class PhotoshopHost {
     const previews = walkLayers<Layer>(doc.layers).filter(isPreview);
     const group = options.hideMarks ? this.marksGroup(doc) : undefined;
     if (!instances.length && !previews.length && !(group && group.visible)) return snapshot.stamp;
-    await this.history(doc, "SAMPS 预览", async () => {
+    await this.history(doc, instances.length ? "SAMPS 创建预览" : "SAMPS 删除预览", () => this.keepUserVisibility(doc, async () => {
       this.assertFresh(snapshot.stamp);
       if (group) group.visible = false;
       const saved = await this.readSelection(doc);
       const active = Array.from(doc.activeLayers).filter((layer: any) => !isPreview(layer));
       for (const layer of previews) layer.delete();
       if (instances.length) {
-        await this.writeSelection(doc, mergeMasks(instances, doc.width, doc.height));
+        await this.writeSelection(doc, documentMask(instances, snapshot, doc));
         doc.activeLayers = [doc.layers[0]];
         // A fill layer made with an active selection is masked to it.
         await this.batchPlay([{ _obj: "make", _target: [{ _ref: "contentLayer" }], using: { _obj: "contentLayer",
@@ -408,7 +508,7 @@ export class PhotoshopHost {
       const image = group ? walkLayers<Layer>(doc.layers).find(layer => !managed(layer) && !layer.layers) : undefined;
       if (image) doc.activeLayers = [image];
       else if (active.length) doc.activeLayers = active;
-    });
+    }));
     return this.stamp();
   }
 
@@ -463,7 +563,7 @@ export class PhotoshopHost {
       for (const layer of walkLayers<Layer>(doc.layers).filter(isPreview)) layer.delete();
       const current = await this.readSelection(doc);
       if (kind === "selection") {
-        let mask = mergeMasks(instances, doc.width, doc.height);
+        let mask = documentMask(instances, snapshot, doc);
         const expand = Math.round(options.expand || 0), feather = Math.max(0, options.feather || 0);
         // Modify the new mask on its own, then combine: expand/feather must not touch the existing selection.
         if (expand || feather) mask = await this.modifyMask(doc, mask, expand, feather);
@@ -480,7 +580,7 @@ export class PhotoshopHost {
             const layer = await this.stampVisible(doc);
             doc.activeLayers = [layer];
             layer.name = `${RESULT_PREFIX} ${options.separate ? `实例 ${i + 1}` : "合并蒙版"}`;
-            await this.writeSelection(doc, mergeMasks(groups[i], doc.width, doc.height));
+            await this.writeSelection(doc, documentMask(groups[i], snapshot, doc));
             await this.batchPlay([{ _obj: "make", new: { _class: "channel" },
               at: { _ref: "channel", _enum: "channel", _value: "mask" },
               using: { _enum: "userMaskEnabled", _value: "revealSelection" }, _options: silent }]);

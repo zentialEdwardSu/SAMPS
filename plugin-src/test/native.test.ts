@@ -47,3 +47,39 @@ test("prompt checksum is verified across the native boundary", async () => {
   corrupt = true;
   await expect(engine.segment(1, prompt, { confidence: .25, mode: "current" })).rejects.toMatchObject({ code: "PROMPT_TRANSFER" });
 });
+
+test("resmooth re-runs only post-processing for the last result", async () => {
+  const requests: { op: string; options: any }[] = [];
+  let resultId = 4;
+  const masks = new Uint8Array([255, 128]);
+  const engine = new NativeEngine({ cancel() {}, submit(op, options) { requests.push({ op, options: JSON.parse(options) }); return 1; },
+    take: () => ({ json: JSON.stringify({ ok: true, value: { resultId, prompt: { sourceBytes: 1, sourcePaintedPixels: 1, alphaChecksum: fnv1a(Uint8Array.of(1)).checksum },
+      instances: [{ id: 3, left: 0, top: 0, width: 2, height: 1, offset: 0, length: 2, confidence: 1 }] } }), buffer: masks.buffer }) });
+  await expect(engine.resmooth(1, { smooth: .2, expand: .8 })).rejects.toMatchObject({ code: "STALE_RESULT" });
+  await engine.segment(1, Uint8Array.of(1), { confidence: .25, mode: "current", smooth: .5, expand: .5 });
+  const found = await engine.resmooth(1, { smooth: .2, expand: .8 });
+  expect(requests.at(-1)).toEqual({ op: "resmooth", options: { sessionId: 1, resultId: 4, smooth: .2, expand: .8 } });
+  expect([...found[0].mask]).toEqual([255, 128]);
+});
+
+test("unload frees the model and invalidates the last result", async () => {
+  const ops: string[] = [];
+  const engine = new NativeEngine({ cancel() {}, submit(op) { ops.push(op); return 1; },
+    take: () => ok({ resultId: 2, instances: [], prompt: { sourceBytes: 1, sourcePaintedPixels: 1, alphaChecksum: fnv1a(Uint8Array.of(1)).checksum } }) });
+  await engine.segment(1, Uint8Array.of(1), { confidence: .25, mode: "current" });
+  expect(engine.lastResultId).toBe(2);
+  await engine.unload();
+  expect(ops.at(-1)).toBe("unload");
+  expect(engine.lastResultId).toBeNull();
+  await expect(engine.resmooth(1, { smooth: .5, expand: .5 })).rejects.toMatchObject({ code: "STALE_RESULT" });
+});
+
+test("load options reach the native loader as a strict boolean and a positive integer size", async () => {
+  const requests: any[] = [];
+  const engine = new NativeEngine({ cancel() {}, submit(_op, options) { requests.push(JSON.parse(options)); return 1; }, take: () => ok({}) });
+  await engine.initialize("model", -2, true, { lowVram: true, inputSize: 672 });
+  await engine.initialize("model", -2, true);
+  await engine.initialize("model", -2, true, { lowVram: "yes" as any, inputSize: 840.5 });
+  await engine.initialize("model", -2, true, { inputSize: -1 });
+  expect(requests.map(item => [item.lowVram, item.inputSize])).toEqual([[true, 672], [false, 0], [false, 0], [false, 0]]);
+});

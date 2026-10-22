@@ -4,12 +4,14 @@ import { MODELS, modelById } from "./models";
 import { ActionButton, Button, Checkbox, IconLabel, Picker, Section, SegmentedSwitch, Slider } from "./spectrum";
 import { SelectionDialog, type SelectionDialogHandle } from "./SelectionDialog";
 import { describeSettings, loadSelectionSettings, saveSelectionSettings, type SelectionSettings } from "../core/settings";
-import { BrushIcon, ClearIcon, EraserIcon, EyeIcon, FolderIcon, InfoIcon, SelectionIcon, Swatch } from "./icons";
+import { BrushIcon, ClearIcon, EraserIcon, EyeIcon, FolderIcon, InfoIcon, PowerIcon, SelectionIcon, Swatch } from "./icons";
 import { SELECTION_MODES, modeFromModifiers } from "../core/selection";
 import { SampsError, describe } from "../core/errors";
 import type { PhotoshopHost, Capture, MarkTool } from "../host/PhotoshopHost";
 import type { MarkKind, Stamp } from "../core/document";
-import type { NativeEngine, PromptDiagnostics } from "../host/NativeEngine";
+import type { Instance, NativeEngine, PromptDiagnostics } from "../host/NativeEngine";
+import { ResultsHistory, stampKey } from "./history";
+import { gpuFailureText, isGpuFailure, lighterOption } from "./lighter";
 
 export interface Services {
   host: PhotoshopHost;
@@ -28,7 +30,11 @@ function sameImage(a: Capture | undefined, b: Capture) {
 
 export function App({ services }: { services: Services }) {
   const { host } = services;
-  const [state, dispatch] = useReducer(reducer, initialState);
+  const [state, dispatch] = useReducer(reducer, initialState, (base): typeof initialState => {
+    let lowVram = base.lowVram;
+    try { lowVram = localStorage.getItem("samps.lowVram") === "1"; } catch { /* storage unavailable */ }
+    return { ...base, lowVram };
+  });
   const engine = useRef<NativeEngine | null>(null);
   const cache = useRef<{ sessionId: number; snapshot: Capture } | null>(null);
   const cancelled = useRef(false);
@@ -36,6 +42,13 @@ export function App({ services }: { services: Services }) {
   const live = useRef(state); live.current = state;
   // Latest stamp the plugin itself produced (preview / output), so its own history states do not read as edits.
   const stampRef = useRef<Stamp | null>(null);
+  // Results per plugin-made history state, for undo / redo; `seen` is the last state refresh handled.
+  const resultsHistory = useRef(new ResultsHistory());
+  const seen = useRef("");
+  const remember = (stamp: Stamp, instances: Instance[], selected: Iterable<number>, snapshot: Capture | null) => {
+    resultsHistory.current.record(stamp, { instances, selected: [...selected], snapshot });
+    seen.current = stampKey(stamp);
+  };
   const selectionDialog = useRef<SelectionDialogHandle>(null);
   const dialogOpen = useRef(false);
   const choice = modelById(state.modelId);
@@ -46,12 +59,31 @@ export function App({ services }: { services: Services }) {
   const action = useCallback(async (work: () => Promise<void>) => {
     if (busy.current) return;
     busy.current = true; cancelled.current = false; dispatch({ type: "busy", busy: true });
+    dispatch({ type: "suggest", suggestion: null });
     try { await work(); }
     catch (error: any) {
-      status(describe(error), error?.code !== "CANCELLED");
+      if (isGpuFailure(error)) reportGpuFailure(error);
+      else status(describe(error), error?.code !== "CANCELLED");
       console.error("SAMPS action:", error);
     } finally { busy.current = false; dispatch({ type: "busy", busy: false }); }
   }, []);
+
+  // Out of GPU memory (or the driver reset after running out): say so, and offer the next lighter
+  // option — first releasing the encoder after each encode, then a smaller SAM 3 input, then YOLOE.
+  const reportGpuFailure = (error: unknown) => {
+    const { modelId, lowVram, model } = live.current;
+    const lost = (error as { code?: string }).code === "GPU_LOST";
+    const option = lighterOption(modelId, lowVram);
+    if (!model || lost) {
+      // The model did not load, or the native side dropped it after the device reset.
+      cache.current = null;
+      dispatch({ type: "modelStatus", model: null,
+        text: lost ? "显卡驱动已重置，模型已卸载。" : "显存不足，模型未能加载。" });
+    }
+    status(gpuFailureText(error, model && !lost ? "识别" : "加载模型", option), true);
+    dispatch({ type: "suggest", suggestion: !option ? null : option.kind === "release" ? { kind: "release" }
+      : { kind: "model", modelId: option.model.id, label: option.model.label } });
+  };
 
   // ── Document tracking (event driven) ──
   const refresh = useCallback(() => {
@@ -60,24 +92,43 @@ export function App({ services }: { services: Services }) {
     dispatch({ type: "document", present: Boolean(doc),
       label: doc ? `${doc.title || doc.name} · ${doc.width}×${doc.height}` : "打开图像后开始标记" });
     try { dispatch({ type: "layers", layers: host.visibility() }); } catch { /* document may be closing */ }
+    if (busy.current) return;
+    let current: Stamp | null = null;
+    try { current = doc ? host.stamp() : null; } catch { /* document may be closing */ }
+    const key = current ? stampKey(current) : "";
+    if (key === seen.current) return;
+    seen.current = key;
     const snapshot = live.current.snapshot;
-    if (snapshot && !busy.current) {
-      try { host.assertFresh(snapshot.stamp); }
-      catch { dispatch({ type: "clearResults" }); status("文档已改变，请重新识别。"); }
+    if (snapshot && current && stampKey(snapshot.stamp) === key) return;
+    // Undo / redo onto a state the plugin produced brings its results back.
+    const saved = current ? resultsHistory.current.get(current) : undefined;
+    if (saved?.snapshot) {
+      dispatch({ type: "restore", instances: saved.instances, selected: saved.selected, snapshot: saved.snapshot });
+      status(`已恢复该历史记录的识别结果（${saved.instances.length} 个实例）。`);
+    } else if (snapshot) {
+      dispatch({ type: "clearResults" });
+      status(saved ? "已撤销识别结果，可重做恢复。" : "文档已改变，请重新识别。");
     }
   }, [host]);
   useEffect(() => { refresh(); return services.subscribe(refresh); }, [services, refresh]);
 
   // ── Model loading ──
-  const loadModel = useCallback(async (folder: { nativePath: string } | null, device: number) => {
+  // Folder of the model last loaded, so "load" after "unload" brings back the same bundle.
+  const loadedFolder = useRef<{ nativePath: string } | null>(null);
+  // `inputSize` selects a SAM 3 quality level (an input-size variant of the same bundle).
+  const loadModel = useCallback(async (folder: { nativePath: string } | null, device: number,
+    { lowVram = live.current.lowVram, inputSize = modelById(live.current.modelId).inputSize ?? 0 } = {}) => {
     if (!engine.current) return;
+    loadedFolder.current = folder;
     cache.current = null; dispatch({ type: "clearResults" });
     if (!folder) { dispatch({ type: "modelStatus", text: "未找到该模型，请选择模型目录。", model: null }); return; }
     dispatch({ type: "modelStatus", text: "正在加载离线模型…", model: null });
-    const info = await engine.current.initialize(folder.nativePath, device, true);
+    const info = await engine.current.initialize(folder.nativePath, device, true, { lowVram, inputSize });
     const trial = info.validationPassed === false ? " · 试用未验证" : "";
+    const low = (info as any).lowVram ? " · 释放编码器显存" : "";
+    const size = (info as any).inputSize ? ` · ${(info as any).inputSize} px` : "";
     dispatch({ type: "modelStatus", model: info,
-      text: `${info.modelName} · ${info.deviceName} · ${info.precision === "fp32" ? "FP32" : "FP16"}${trial}` });
+      text: `${info.modelName} · ${info.deviceName} · ${info.precision === "fp32" ? "FP32" : "FP16"}${size}${low}${trial}` });
     status("模型已就绪。点击画笔开始标记。");
   }, []);
 
@@ -101,14 +152,45 @@ export function App({ services }: { services: Services }) {
     // GPU-only bundles refuse the CPU provider; switch the device back to GPU for them.
     const device = modelById(id).gpuOnly ? -2 : state.device;
     dispatch({ type: "set", patch: { modelId: id, device } });
-    action(async () => loadModel(await services.modelFolder(modelById(id).folder), device));
+    action(async () => loadModel(await services.modelFolder(modelById(id).folder), device, { inputSize: modelById(id).inputSize ?? 0 }));
   };
   const changeDevice = (value: string) => {
     const device = Number(value);
     dispatch({ type: "set", patch: { device } });
     action(async () => loadModel(await services.modelFolder(choice.folder), device));
   };
-  const browseModel = () => action(async () => { const folder = await services.pickFolder(); if (folder) await loadModel(folder, state.device); });
+  // Unloading frees the model, the cached image features and the DirectML arena (GPU memory);
+  // results already found stay usable for output. Loading again re-reads the same bundle.
+  const toggleModel = () => action(async () => {
+    const e = engine.current;
+    if (!e) return;
+    if (state.model) {
+      await e.unload();
+      cache.current = null;
+      dispatch({ type: "modelStatus", text: "模型已卸载，显存已释放。点击电源按钮重新加载。", model: null });
+      status("模型已卸载。已有的识别结果仍可输出；重新识别前请先加载模型。");
+    } else {
+      await loadModel(loadedFolder.current || await services.modelFolder(choice.folder), state.device);
+    }
+  });
+  // Low-VRAM mode is a load option: reload the model with it (results already found are kept).
+  const changeLowVram = (lowVram: boolean) => {
+    dispatch({ type: "set", patch: { lowVram } });
+    try { localStorage.setItem("samps.lowVram", lowVram ? "1" : "0"); } catch { /* storage unavailable */ }
+    if (!state.model) return;
+    action(async () => loadModel(loadedFolder.current || await services.modelFolder(choice.folder), state.device, { lowVram }));
+  };
+  const applySuggestion = () => {
+    const suggestion = state.suggestion;
+    dispatch({ type: "suggest", suggestion: null });
+    if (!suggestion) return;
+    if (suggestion.kind === "release") {
+      dispatch({ type: "set", patch: { lowVram: true } });
+      try { localStorage.setItem("samps.lowVram", "1"); } catch { /* storage unavailable */ }
+      action(async () => loadModel(loadedFolder.current || await services.modelFolder(choice.folder), state.device, { lowVram: true }));
+    } else changeModel(suggestion.modelId);
+  };
+  const browseModel = () => action(async () => { const folder = await services.pickFolder(); if (folder) await loadModel(folder, state.device, { inputSize: 0 }); });
 
   // ── Prompt tools ──
   // Picking add/exclude or brush/eraser always targets the matching layer, so no manual layer switching.
@@ -125,7 +207,11 @@ export function App({ services }: { services: Services }) {
     const current = host.visibility()[target];
     if (current === null) return;
     const next = await host.setVisibility(target, !current);
-    if (next) { stampRef.current = next; dispatch({ type: "restamp", stamp: next }); }
+    if (next) {
+      stampRef.current = next; dispatch({ type: "restamp", stamp: next });
+      const { instances, selected, snapshot } = live.current;
+      remember(next, instances, selected, snapshot);
+    }
     dispatch({ type: "layers", layers: host.visibility() });
   });
   const clearPrompt = () => action(async () => {
@@ -151,7 +237,7 @@ export function App({ services }: { services: Services }) {
     status("正在根据涂抹分割…");
     let found;
     try {
-      found = await e.segment(cache.current.sessionId, captured.alpha, { confidence: state.confidence, mode: state.mode, detail: state.detail },
+      found = await e.segment(cache.current.sessionId, captured.alpha, { confidence: state.confidence, mode: state.mode, detail: state.detail, smooth: state.smooth, expand: state.expand },
         captured.exclude);
     }
     finally {
@@ -162,15 +248,40 @@ export function App({ services }: { services: Services }) {
       console.info("SAMPS prompt input", { ...diagnostics, grid: undefined });
     }
     checkCancelled(); host.assertFresh(captured.stamp);
+    // Undoing the preview lands on the read state: there are no results there.
+    remember(captured.stamp, [], [], null);
     // Show every result on the canvas right away; the preview adds a history state, so restamp.
     captured.stamp = await host.showPreview(captured, found, { hideMarks: found.length > 0 });
     dispatch({ type: "layers", layers: host.visibility() });
     stampRef.current = captured.stamp;
     dispatch({ type: "results", instances: found, snapshot: captured });
+    remember(captured.stamp, found, found.map(item => item.id), captured);
     const merged = found.length === 1 && (found[0].parts ?? 1) > 1 ? `（已合并 ${found[0].parts} 个部分）` : "";
     status(found.length ? `找到 ${found.length} 个实例${merged}。红色为预览，标记层已隐藏（可随时用“标记”按钮打开）。`
       : "没有找到匹配实例。可扩大涂抹范围或降低置信度。");
   });
+  // Edge sliders: re-run only the native post-processing of the current result, then refresh the preview.
+  const adjustEdges = (patch: { smooth?: number; expand?: number }) => {
+    dispatch({ type: "set", patch });
+    if (!live.current.snapshot || !cache.current) return;
+    action(async () => {
+      const e = engine.current, snapshot = live.current.snapshot;
+      if (!e || !snapshot || !cache.current) return;
+      host.assertFresh(snapshot.stamp);
+      const smoothing = { smooth: patch.smooth ?? live.current.smooth, expand: patch.expand ?? live.current.expand };
+      status("正在调整边缘…");
+      const found = await e.resmooth(cache.current.sessionId, smoothing);
+      checkCancelled();
+      dispatch({ type: "remask", instances: found });
+      const selected = live.current.selected;
+      const next = await host.showPreview(snapshot, found.filter(item => selected.has(item.id)));
+      stampRef.current = next;
+      dispatch({ type: "restamp", stamp: next });
+      dispatch({ type: "layers", layers: host.visibility() });
+      remember(next, found, selected, { ...snapshot, stamp: next });
+      status(`边缘已更新（平滑 ${Math.round(smoothing.smooth * 100)}%，补全 ${Math.round(smoothing.expand * 100)}%）。`);
+    });
+  };
   const cancel = () => { cancelled.current = true; engine.current?.cancel(); status("正在取消…"); };
 
   // ── Preview ──
@@ -180,6 +291,7 @@ export function App({ services }: { services: Services }) {
     const next = await host.showPreview(snapshot, live.current.instances.filter(item => selected.has(item.id)));
     stampRef.current = next;
     dispatch({ type: "restamp", stamp: next });
+    remember(next, live.current.instances, selected, snapshot);
     dispatch({ type: "layers", layers: host.visibility() });
   });
   const toggle = (id: number) => {
@@ -216,6 +328,7 @@ export function App({ services }: { services: Services }) {
       await host.output(snapshot, picked, kind, { separate: state.separate, mode, ...settings });
       stampRef.current = host.stamp();
       dispatch({ type: "restamp", stamp: stampRef.current });
+      remember(stampRef.current, live.current.instances, live.current.selected, snapshot);
       const label = SELECTION_MODES.find(item => item.mode === mode)!.label;
       const extra = describeSettings(settings);
       status(kind === "selection" ? `已${label === "新选区" ? "生成新选区" : label}${extra ? `（${extra}）` : ""}。`
@@ -249,7 +362,12 @@ export function App({ services }: { services: Services }) {
     <main className="panel">
       <header className="doc"><sp-body size="XS" class="doc-name" title={state.documentLabel}>{state.documentLabel}</sp-body></header>
 
-      <Section title="模型" aside={<ActionButton quiet title="选择模型目录" onClick={browseModel} disabled={working}><FolderIcon /></ActionButton>}>
+      <Section title="模型" aside={
+        <div className="inline">
+          <ActionButton quiet selected={Boolean(model)} title={model ? "卸载模型，释放显存和计算缓存" : "加载模型"}
+            onClick={toggleModel} disabled={working}><PowerIcon /></ActionButton>
+          <ActionButton quiet title="选择模型目录" onClick={browseModel} disabled={working}><FolderIcon /></ActionButton>
+        </div>}>
         <div className="row">
           <Picker label="分割模型" value={state.modelId} disabled={working}
             options={MODELS.map(item => ({ value: item.id, label: item.label }))} onChange={changeModel} />
@@ -257,6 +375,7 @@ export function App({ services }: { services: Services }) {
             options={choice.gpuOnly ? [{ value: "-2", label: "GPU" }] : [{ value: "-2", label: "GPU" }, { value: "-1", label: "CPU" }]}
             onChange={changeDevice} />
         </div>
+        <Checkbox checked={state.lowVram} disabled={working} onChange={changeLowVram}>编码后释放编码器显存以降低显存占用</Checkbox>
         <sp-detail class="muted">{state.modelStatus}</sp-detail>
       </Section>
 
@@ -296,6 +415,10 @@ export function App({ services }: { services: Services }) {
           format={value => value.toFixed(2)} onChange={value => invalidate({ type: "set", patch: { confidence: value } })} />
         <Checkbox checked={state.detail} disabled={working}
           onChange={checked => invalidate({ type: "set", patch: { detail: checked } })}>精细边缘（当前模式，多约 1–2 秒）</Checkbox>
+        <Slider label="边缘平滑" min={0} max={1} step={0.05} value={state.smooth} disabled={working}
+          format={value => `${Math.round(value * 100)}%`} onChange={value => adjustEdges({ smooth: value })} />
+        <Slider label="缺口补全" min={0} max={1} step={0.05} value={state.expand} disabled={working}
+          format={value => `${Math.round(value * 100)}%`} onChange={value => adjustEdges({ expand: value })} />
         <div className="actions">
           {working
             ? <Button variant="secondary" onClick={cancel} title="Esc">取消</Button>
@@ -303,6 +426,12 @@ export function App({ services }: { services: Services }) {
         </div>
         {working && <sp-progressbar class="progress" indeterminate size="s" />}
         <sp-detail class={state.status.error ? "status error" : "status"} role="status" aria-live="polite">{state.status.text}</sp-detail>
+        {state.suggestion && !working && (
+          <div className="actions">
+            <Button variant="primary" onClick={applySuggestion}>
+              {state.suggestion.kind === "release" ? "开启释放编码器显存并重新加载" : `换用 ${state.suggestion.label}`}
+            </Button>
+          </div>)}
       </Section>
 
       <Section title={`实例${state.instances.length ? ` · ${chosen.length}/${state.instances.length}` : ""}`}

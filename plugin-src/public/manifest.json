@@ -2,7 +2,7 @@
   "manifestVersion": 6,
   "id": "samps.edwardsu",
   "name": "SAMPS",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "main": "index.html",
   "host": { "app": "PS", "minVersion": "25.0.0", "data": { "apiVersion": 2 } },
   "addon": { "name": "samps-0.5.0.uxpaddon" },

@@ -24,6 +24,13 @@ export interface State {
   preview: string | null;
   diagnosticsOpen: boolean;
   markKind: MarkKind;
+  /** Edge post-processing, 0..1: contour smoothing / edge softness, and how far gaps are filled. */
+  smooth: number;
+  expand: number;
+  /** Release the image encoder's GPU memory after each encode (slower per new image). */
+  lowVram: boolean;
+  /** After a GPU memory failure: what the panel offers to switch to (null when nothing is pending). */
+  suggestion: { kind: "release" } | { kind: "model"; modelId: string; label: string } | null;
   /** Re-run the edge refine on a crop around the object (one extra encoder pass). */
   detail: boolean;
   markTool: MarkTool;
@@ -37,7 +44,7 @@ export const initialState: State = {
   busy: false, status: { text: "", error: false },
   mode: "current", confidence: 0.25, selectionMode: "new", separate: false,
   instances: [], selected: new Set(), snapshot: null, diagnostics: null, preview: null, diagnosticsOpen: false,
-  markKind: "add", markTool: "brush", detail: true, layers: { marks: null, preview: null }
+  markKind: "add", markTool: "brush", detail: true, smooth: 0.5, expand: 0.5, lowVram: false, suggestion: null, layers: { marks: null, preview: null }
 };
 
 export type Action =
@@ -45,13 +52,18 @@ export type Action =
   | { type: "busy"; busy: boolean }
   | { type: "status"; text: string; error?: boolean }
   | { type: "modelStatus"; text: string; model?: ModelInfo | null }
-  | { type: "set"; patch: Partial<Pick<State, "modelId" | "device" | "mode" | "confidence" | "selectionMode" | "separate" | "diagnosticsOpen" | "markKind" | "markTool" | "detail">> }
+  | { type: "set"; patch: Partial<Pick<State, "modelId" | "device" | "mode" | "confidence" | "selectionMode" | "separate" | "diagnosticsOpen" | "markKind" | "markTool" | "detail" | "smooth" | "expand" | "lowVram">> }
   | { type: "results"; instances: Instance[]; snapshot: Capture }
   | { type: "clearResults" }
   | { type: "toggle"; id: number }
   | { type: "selectAll"; on: boolean }
   | { type: "diagnostics"; diagnostics: PromptDiagnostics | null; preview?: string | null }
   | { type: "restamp"; stamp: Capture["stamp"] }
+  /** Undo / redo moved to a history state with known results. */
+  | { type: "restore"; instances: Instance[]; selected: number[]; snapshot: Capture | null }
+  /** New masks for the same instances after re-running the edge post-processing. */
+  | { type: "remask"; instances: Instance[] }
+  | { type: "suggest"; suggestion: State["suggestion"] }
   | { type: "layers"; layers: State["layers"] };
 
 export function reducer(state: State, action: Action): State {
@@ -75,6 +87,12 @@ export function reducer(state: State, action: Action): State {
     case "selectAll": return { ...state, selected: action.on ? new Set(state.instances.map(item => item.id)) : new Set() };
     case "diagnostics": return { ...state, diagnostics: action.diagnostics,
       ...(action.preview !== undefined ? { preview: action.preview } : {}) };
+    case "suggest": return state.suggestion === action.suggestion ? state : { ...state, suggestion: action.suggestion };
+    case "remask": {
+      const ids = new Set(action.instances.map(item => item.id));
+      return { ...state, instances: action.instances, selected: new Set([...state.selected].filter(id => ids.has(id))) };
+    }
+    case "restore": return { ...state, instances: action.instances, selected: new Set(action.selected), snapshot: action.snapshot };
     case "restamp": return state.snapshot ? { ...state, snapshot: { ...state.snapshot, stamp: action.stamp } } : state;
     case "layers":
       return state.layers.marks === action.layers.marks && state.layers.preview === action.layers.preview ? state

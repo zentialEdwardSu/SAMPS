@@ -54,6 +54,8 @@ public:
         image_ = openSession(graphPath(directory_, manifest_, "image"), device, manifest_);
         prompt_ = openSession(graphPath(directory_, manifest_, "prompt"), device, manifest_);
     }
+    // Prototypes are 160×160 over the 640 letterbox: one cell is 4 model pixels.
+    double maskCell(const Geometry& g) const override { return 4.0 / g.scale; }
     Json describeModel() const override {
         return {{"modelName", manifest_.value("modelName", "YOLOE-26")}, {"modelScale", manifest_.value("modelScale", "x")},
                 {"architecture", "yoloe26"}, {"promptKind", "visual"}, {"resample", resampleName(resample_)},
@@ -155,20 +157,24 @@ public:
             std::fill(modelMask.begin(), modelMask.end(), 0);
             for (int y = std::max(0, static_cast<int>(std::ceil(b[1]))); y < std::min(Size, static_cast<int>(std::ceil(b[3]))); ++y)
                 for (int x = std::max(0, static_cast<int>(std::ceil(b[0]))); x < std::min(Size, static_cast<int>(std::ceil(b[2]))); ++x)
-                    if (bilinearSample(low.data(), pw, ph, (x + .5f) * pw / Size - .5f, (y + .5f) * ph / Size - .5f) > 0)
-                        modelMask[y * Size + x] = 255;
+                    if (const float logit = bilinearSample(low.data(), pw, ph, (x + .5f) * pw / Size - .5f, (y + .5f) * ph / Size - .5f);
+                        logit > SupportLogit)
+                        modelMask[y * Size + x] = logit > 0 ? 255 : 1;  // 1 = weak support for gap closing
             const size_t maskBytes = static_cast<size_t>(instance.width) * instance.height;
             if (maskBytes > 400000000 - resultBytes) throw Error("RESULT_TOO_LARGE", "Masks exceed 400 MB; increase confidence");
             instance.mask.resize(maskBytes);
+            instance.support.resize(maskBytes);
             size_t intersection = 0, nonzero = 0;
             for (int y = 0; y < instance.height; ++y) for (int x = 0; x < instance.width; ++x) {
                 const int dx = x + instance.left, dy = y + instance.top;
                 const int sx = std::min(Size - 1, g.left + dx * g.resizedWidth / g.width);
                 const int sy = std::min(Size - 1, g.top + dy * g.resizedHeight / g.height);
                 const uint8_t value = modelMask[sy * Size + sx];
-                instance.mask[static_cast<size_t>(y) * instance.width + x] = value;
-                nonzero += value > 0;
-                intersection += value > 0 && alpha[static_cast<size_t>(dy) * g.width + dx] > 0;
+                const bool on = value == 255;
+                instance.mask[static_cast<size_t>(y) * instance.width + x] = on ? 255 : 0;
+                instance.support[static_cast<size_t>(y) * instance.width + x] = value ? 1 : 0;
+                nonzero += on;
+                intersection += on && alpha[static_cast<size_t>(dy) * g.width + dx] > 0;
             }
             if (!nonzero) continue;
             instance.overlap = static_cast<float>(intersection) / std::max<size_t>(1, promptCount);
